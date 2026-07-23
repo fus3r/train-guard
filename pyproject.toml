@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "train-guard"
+version = "0.2.0"
+description = "Job-level battery and thermal policy for long-running laptop processes."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [{ name = "fus3r" }]
+keywords = ["battery", "laptop", "thermal", "macbook", "training", "power", "psutil", "cli", "deep-learning"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+]
+dependencies = ["psutil>=5.9"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.urls]
+Homepage = "https://github.com/fus3r/train-guard"
+Issues = "https://github.com/fus3r/train-guard/issues"
+
+[project.scripts]
+train-guard = "trainguard.cli:main"
+
+[tool.setuptools]
+packages = ["trainguard"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]

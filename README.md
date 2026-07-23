@@ -1,0 +1,158 @@
+# train-guard
+
+[![CI](https://github.com/fus3r/train-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/fus3r/train-guard/actions/workflows/ci.yml)
+
+`train-guard` supervises one long-running job on a laptop. It can pause the
+process tree when AC power is removed, lower its scheduling priority when the
+battery is warm, pause at a configured temperature, and continue the same live
+processes after power returns.
+
+The operating system remains responsible for CPU and SoC protection. This tool
+only applies a job-level battery and power policy.
+
+```bash
+train-guard run --name train -- python train.py --epochs 200
+train-guard attach --match "python train.py"
+train-guard status
+train-guard stop train
+```
+
+This repository is a public release snapshot. The package is MIT licensed.
+
+## What pause and gentle mode mean
+
+Pause and resume use host process APIs through `psutil`. On POSIX systems this
+is equivalent to `SIGSTOP` and `SIGCONT`. The process stays in memory, and
+multiprocessing children are included.
+
+Gentle mode is a best-effort scheduling request:
+
+- macOS applies `taskpolicy -b`. The kernel still chooses the cores, so this
+  does not pin a job to efficiency cores.
+- Linux narrows CPU affinity and requests idle I/O priority. Full mode restores
+  the original affinity.
+- Windows switches the process tree to `IDLE_PRIORITY_CLASS` and restores
+  normal priority in full mode.
+
+Charging tools such as AlDente or `batt` manage charge limits. System tools such
+as TLP and auto-cpufreq manage broader machine policy. `train-guard` only
+controls the named job.
+
+## Install
+
+The package is not on PyPI. Install it from a checkout:
+
+```bash
+git clone https://github.com/fus3r/train-guard.git
+cd train-guard
+python -m pip install -e .
+```
+
+You can also run `python trainguard/cli.py status` without installing the
+command. A standalone macOS shell implementation is under [`macos/`](macos/).
+
+## Platform behavior
+
+| Platform | Pause and resume | Gentle mode | Battery temperature | Login restart |
+|---|---|---|---|---|
+| macOS | process suspend and resume | background scheduling hint | `ioreg`, no sudo | launchd starts a new process |
+| Linux | process suspend and resume | reduced CPU affinity, idle I/O | psutil sensors or sysfs | systemd user service starts a new process |
+| Windows | process suspend and resume | idle priority class | usually unavailable | scheduled task starts a new process |
+
+CI runs the policy, CLI, persistence, sensor and child-process tests on macOS,
+Linux and Windows with Python 3.9 and 3.13. Battery temperature still depends
+on the hardware and driver. When no pack sensor is available, thermal rules are
+skipped while power-source and charge rules remain active.
+
+## Usage
+
+```bash
+# Start a command. Its output is written to ~/.train-guard/logs/<name>.log.
+train-guard run --name bigtrain -- python train.py --epochs 200
+
+# Adopt an existing process.
+train-guard attach --match "python train.py" --name bigtrain
+train-guard attach --pid 12345
+
+train-guard list
+train-guard status
+train-guard stop bigtrain
+train-guard stop bigtrain --kill
+train-guard config --init
+```
+
+### Sleep is not reboot
+
+Sleep preserves RAM. A suspended job can continue after the machine wakes.
+
+A reboot destroys the process and its in-memory state. With
+`--restart-on-login`, `train-guard` saves the command line and starts a new
+process at the next login:
+
+```bash
+train-guard run --restart-on-login --name bigtrain -- \
+  python train.py --resume-from-checkpoint latest
+train-guard install-agent
+```
+
+The application must load its own checkpoint if it needs to continue prior
+work. An attached job can wait for a matching process or define a start command:
+
+```bash
+train-guard attach --restart-on-login --name dataprep \
+  --match "build_index.py" --start "bash run_prep.sh"
+```
+
+`--persist` remains as a compatibility alias. It restarts or reattaches after
+login; it cannot restore RAM.
+
+## Policy
+
+The supervisor rereads `~/.train-guard/config.json` while it runs.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `run_on_battery` | `false` | pause when unplugged |
+| `battery_floor_pct` | `30` | pause at or below this charge when battery running is enabled |
+| `ac_band` | `full` | scheduling band on AC while cool |
+| `battery_band` | `gentle` | scheduling band on battery |
+| `temp_charge_gentle_c` | `35` | gentle mode while warm and charging below the cutoff |
+| `temp_gentle_c` | `38` | gentle mode on AC at or above this pack temperature |
+| `temp_pause_c` | `42` | pause at or above this pack temperature |
+| `temp_resume_c` | `36` | leave a thermal pause at or below this pack temperature |
+| `charge_cool_until_pct` | `80` | charge cutoff for the warm-charging rule |
+
+The default pack thresholds are 35, 38 and 42 degrees Celsius, with resume at
+36. They are conservative choices for this tool, not manufacturer safety
+limits. Apple's published 10 to 35 degree range is an
+[ambient operating range](https://support.apple.com/en-us/102336), not a battery
+pack range.
+
+Version 0.1 keys `temp_ecore_c` and `temp_charge_ecore_c` still load for
+compatibility. New configurations use `gentle` because no supported API
+guarantees a particular core class.
+
+## Supervisor loop
+
+Every `poll` seconds, the supervisor reads power, charge and available
+temperature sensors. It selects `full`, `gentle` or `stop` for the process tree.
+Thermal pause has hysteresis: with the defaults, a job paused at 42 degrees
+stays paused until the pack reaches 36.
+
+Closing the lid needs no special path because the supervisor and worker sleep
+with the laptop. Login persistence creates a new process after reboot.
+
+## Tests
+
+```bash
+python -m pip install -e '.[test]'
+python -m pytest
+bash -n macos/train-guard.sh
+```
+
+The GitHub Actions matrix runs on `ubuntu-latest`, `macos-latest` and
+`windows-latest`.
+
+## License
+
+MIT, 2026.
