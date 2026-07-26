@@ -92,3 +92,14 @@ def test_config_init_creates_its_parent(capsys):
     cfg = json.loads(cli.CONFIGF.read_text())
     assert cfg["temp_gentle_c"] == 38
     assert "temp_ecore_c" not in cfg
+
+
+def test_run_rejects_invalid_config_before_spawning(fake_spawn, capsys):
+    cli._ensure_dirs()
+    cli.CONFIGF.write_text('{"poll": "fast"}', encoding="utf-8")
+
+    result = cli.main(["run", "--name", "training", "--", "python", "train.py"])
+
+    assert result == 2
+    assert fake_spawn == []
+    assert "poll must be a number" in capsys.readouterr().err

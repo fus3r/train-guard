@@ -1,4 +1,4 @@
-import json
+from dataclasses import replace
 
 import pytest
 
@@ -12,29 +12,6 @@ def set_readings(monkeypatch, *, source="AC", percent=80, temp=30.0, charging=Fa
     monkeypatch.setattr(cli, "is_charging", lambda: charging)
 
 
-def test_defaults_match_documented_thresholds():
-    cfg = cli.load_config()
-    assert cfg["temp_charge_gentle_c"] == 35
-    assert cfg["temp_gentle_c"] == 38
-    assert cfg["temp_pause_c"] == 42
-    assert cfg["temp_resume_c"] == 36
-
-
-def test_v01_ecore_config_keys_are_migrated():
-    cli._ensure_dirs()
-    cli.CONFIGF.write_text(json.dumps({
-        "temp_ecore_c": 39,
-        "temp_charge_ecore_c": 34,
-    }))
-
-    cfg = cli.load_config()
-
-    assert cfg["temp_gentle_c"] == 39
-    assert cfg["temp_charge_gentle_c"] == 34
-    assert "temp_ecore_c" not in cfg
-    assert "temp_charge_ecore_c" not in cfg
-
-
 def test_pauses_on_battery_by_default(monkeypatch):
     set_readings(monkeypatch, source="Battery", percent=95, temp=None)
     decision, signature = cli.decide(cli.load_config())
@@ -43,8 +20,7 @@ def test_pauses_on_battery_by_default(monkeypatch):
 
 
 def test_optional_battery_mode_obeys_floor(monkeypatch):
-    cfg = cli.load_config()
-    cfg["run_on_battery"] = True
+    cfg = replace(cli.load_config(), run_on_battery=True)
 
     set_readings(monkeypatch, source="Battery", percent=31, temp=None)
     assert cli.decide(cfg)[0] == "gentle"
@@ -54,8 +30,8 @@ def test_optional_battery_mode_obeys_floor(monkeypatch):
 
 
 def test_thermal_limit_overrides_allowed_battery_band(monkeypatch):
-    cfg = cli.load_config()
-    cfg.update(
+    cfg = replace(
+        cli.load_config(),
         run_on_battery=True,
         battery_floor_pct=0,
         battery_band="full",
@@ -67,8 +43,7 @@ def test_thermal_limit_overrides_allowed_battery_band(monkeypatch):
 
 
 def test_battery_band_is_used_before_ac_warm_rules(monkeypatch):
-    cfg = cli.load_config()
-    cfg.update(run_on_battery=True, battery_band="full")
+    cfg = replace(cli.load_config(), run_on_battery=True, battery_band="full")
     set_readings(monkeypatch, source="Battery", percent=80, temp=38.0)
 
     assert cli.decide(cfg)[0] == "full"
@@ -119,12 +94,11 @@ def test_warm_charging_rule_stops_at_charge_cutoff(monkeypatch):
 
 
 def test_configured_bands_apply_when_no_higher_priority_rule_matches(monkeypatch):
-    cfg = cli.load_config()
-    cfg["ac_band"] = "gentle"
+    cfg = replace(cli.load_config(), ac_band="gentle")
     set_readings(monkeypatch, source="AC", percent=80, temp=30.0)
     assert cli.decide(cfg)[0] == "gentle"
 
-    cfg.update(run_on_battery=True, battery_band="full")
+    cfg = replace(cfg, run_on_battery=True, battery_band="full")
     set_readings(monkeypatch, source="Battery", percent=80, temp=30.0)
     assert cli.decide(cfg)[0] == "full"
 

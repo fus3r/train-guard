@@ -7,6 +7,7 @@ Process control uses psutil; battery readings come from the host OS when they
 are available.
 """
 from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -18,6 +19,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+if __package__:
+    from .config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
+else:  # Keep direct execution from a checkout working.
+    from config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
 
 try:
     import psutil
@@ -32,19 +38,6 @@ TG_HOME = Path(os.environ.get("TRAIN_GUARD_HOME", HOME / ".train-guard"))
 RUNDIR, LOGDIR, PERSIST = TG_HOME / "run", TG_HOME / "logs", TG_HOME / "persist"
 CONFIGF = TG_HOME / "config.json"
 
-DEFAULTS = {
-    "poll": 20,                  # seconds between checks
-    "run_on_battery": False,     # False = pause when unplugged (no cycling/deep discharge)
-    "battery_floor_pct": 30,     # if run_on_battery, stop below this %
-    "battery_band": "gentle",    # on battery: 'gentle' | 'full'
-    "ac_band": "full",           # on AC and cool: 'full' | 'gentle'
-    "temp_gentle_c": 38,         # on AC, at/above this battery temp -> gentle
-    "temp_pause_c": 42,          # at/above this -> pause to cool (hysteresis)
-    "temp_resume_c": 36,         # resume from thermal pause once cooled to/below this
-    "charge_cool_until_pct": 80, # while charging below this %...
-    "temp_charge_gentle_c": 35,  # ...and >= this battery temp -> gentle (charge cool)
-}
-
 # Linux niceness cannot normally be raised back to its original value by an
 # unprivileged process. Keep a reversible CPU-affinity snapshot instead.
 _LINUX_AFFINITY = {}
@@ -55,23 +48,8 @@ def _ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
-def load_config():
-    cfg = dict(DEFAULTS)
-    try:
-        if CONFIGF.exists():
-            user_cfg = json.loads(CONFIGF.read_text())
-            # v0.1 called this threshold "ecore", but taskpolicy only supplies a
-            # scheduling hint; it cannot pin work to Apple efficiency cores.
-            if "temp_gentle_c" not in user_cfg and "temp_ecore_c" in user_cfg:
-                user_cfg["temp_gentle_c"] = user_cfg["temp_ecore_c"]
-            if "temp_charge_gentle_c" not in user_cfg and "temp_charge_ecore_c" in user_cfg:
-                user_cfg["temp_charge_gentle_c"] = user_cfg["temp_charge_ecore_c"]
-            user_cfg.pop("temp_ecore_c", None)
-            user_cfg.pop("temp_charge_ecore_c", None)
-            cfg.update(user_cfg)
-    except Exception:
-        pass
-    return cfg
+def load_config() -> PolicyConfig:
+    return load_policy(CONFIGF)
 
 
 def _now():
@@ -174,34 +152,39 @@ class _Cool:
     on = False  # thermal cooldown hysteresis state (per supervisor process)
 
 
-def decide(cfg):
+def decide(cfg: PolicyConfig):
     src, pct, temp, chg = power_source(), battery_pct(), battery_temp_c(), is_charging()
     tshow = "n/a" if temp is None else round(temp)
     sig = f"power={src} batt={pct}% temp={tshow}C charging={'yes' if chg else 'no'}"
     have_t = temp is not None
 
     if _Cool.on:
-        if have_t and temp <= cfg["temp_resume_c"]:
+        if have_t and temp <= cfg.temp_resume_c:
             _Cool.on = False
         else:
             return "stop", sig
-    if have_t and temp >= cfg["temp_pause_c"]:
+    if have_t and temp >= cfg.temp_pause_c:
         _Cool.on = True
         return "stop", sig
 
     if src == "Battery":
-        if not cfg["run_on_battery"]:
+        if not cfg.run_on_battery:
             return "stop", sig
-        if pct <= cfg["battery_floor_pct"]:
+        if pct <= cfg.battery_floor_pct:
             return "stop", sig
-        return ("gentle" if cfg["battery_band"] == "gentle" else "full"), sig
+        return ("gentle" if cfg.battery_band == "gentle" else "full"), sig
 
     # on AC
-    if have_t and temp >= cfg["temp_gentle_c"]:
+    if have_t and temp >= cfg.temp_gentle_c:
         return "gentle", sig
-    if chg and pct < cfg["charge_cool_until_pct"] and have_t and temp >= cfg["temp_charge_gentle_c"]:
+    if (
+        chg
+        and pct < cfg.charge_cool_until_pct
+        and have_t
+        and temp >= cfg.temp_charge_gentle_c
+    ):
         return "gentle", sig
-    return ("gentle" if cfg["ac_band"] == "gentle" else "full"), sig
+    return ("gentle" if cfg.ac_band == "gentle" else "full"), sig
 
 
 # Process lookup.
@@ -290,10 +273,11 @@ def cmd_supervise(meta_path):
     meta = json.loads(Path(meta_path).read_text())
     name = meta["name"]
     detail = f"pattern={meta.get('pattern')}" if meta["mode"] == "attach" else f"jobpid={meta.get('jobpid')}"
+    cfg = load_config()
+    watcher = ConfigWatcher(CONFIGF, cfg)
     _glog(name, f"START mode={meta['mode']} {detail}")
     last, miss = None, 0
     while True:
-        cfg = load_config()
         stopf = RUNDIR / f"{name}.stop"
         if stopf.exists():
             how = stopf.read_text().strip()
@@ -322,12 +306,18 @@ def cmd_supervise(meta_path):
                 except FileNotFoundError:
                     pass
             return
+        cfg, config_changed, config_error = watcher.poll()
+        if config_changed:
+            if config_error:
+                _glog(name, f"CONFIG rejected: {config_error}; keeping last valid policy")
+            else:
+                _glog(name, "CONFIG loaded")
         procs = _targets(meta)
         if meta["mode"] == "attach" and not procs:
             miss += 1
             if miss % 15 == 1:
                 _glog(name, "no process matches pattern yet (waiting)")
-            time.sleep(cfg["poll"])
+            time.sleep(cfg.poll)
             continue
         miss = 0
         decision, sig = decide(cfg)
@@ -336,13 +326,17 @@ def cmd_supervise(meta_path):
         if line != last:
             _glog(name, f"-> {decision}   ({sig})")
             last = line
-        time.sleep(cfg["poll"])
+        time.sleep(cfg.poll)
 
 
 # CLI commands.
-def _policy_line(cfg):
-    batt = "pause" if not cfg["run_on_battery"] else f"{cfg['battery_band']} (floor {cfg['battery_floor_pct']}%)"
-    return f"AC={cfg['ac_band']}  battery={batt}"
+def _policy_line(cfg: PolicyConfig):
+    batt = (
+        "pause"
+        if not cfg.run_on_battery
+        else f"{cfg.battery_band} (floor {cfg.battery_floor_pct:g}%)"
+    )
+    return f"AC={cfg.ac_band}  battery={batt}"
 
 
 def _restart_on_login(args):
@@ -453,8 +447,13 @@ def cmd_status(args):
     print()
     print("policy (config.json)")
     print(f"  {_policy_line(cfg)}")
-    print(f"  thermal: gentle >= {cfg['temp_gentle_c']}°C  pause >= {cfg['temp_pause_c']}°C  "
-          f"resume <= {cfg['temp_resume_c']}°C   charge cool: <{cfg['charge_cool_until_pct']}% and >= {cfg['temp_charge_gentle_c']}°C")
+    print(
+        f"  thermal: gentle >= {cfg.temp_gentle_c:g}°C  "
+        f"pause >= {cfg.temp_pause_c:g}°C  "
+        f"resume <= {cfg.temp_resume_c:g}°C   "
+        f"charge cool: <{cfg.charge_cool_until_pct:g}% "
+        f"and >= {cfg.temp_charge_gentle_c:g}°C"
+    )
     print()
     print("active guards")
     metas = sorted(RUNDIR.glob("*.meta.json"))
@@ -506,14 +505,15 @@ def cmd_stop(args):
 
 def cmd_config(args):
     _ensure_dirs()
+    defaults = PolicyConfig().to_dict()
+    if getattr(args, "init", False):
+        CONFIGF.write_text(json.dumps(defaults, indent=2), encoding="utf-8")
+    cfg = load_config()
     print(f"policy: {CONFIGF}\n")
-    if CONFIGF.exists():
-        print(CONFIGF.read_text())
-    else:
-        print(json.dumps(DEFAULTS, indent=2))
+    print(json.dumps(cfg.to_dict(), indent=2))
+    if not CONFIGF.exists():
         print("\n(no config.json yet; defaults shown. run `train-guard config --init` to write it)")
     if getattr(args, "init", False):
-        CONFIGF.write_text(json.dumps(DEFAULTS, indent=2))
         print(f"\nwrote {CONFIGF}")
     return 0
 
@@ -526,6 +526,7 @@ def cmd_restart_persisted(args):
     that can checkpoint may continue from their own last durable checkpoint.
     """
     _ensure_dirs()
+    load_config()
     for jf in sorted(PERSIST.glob("*.job")):
         try:
             j = json.loads(jf.read_text())
@@ -650,13 +651,16 @@ def build_parser():
     r.set_defaults(fn=cmd_run)
 
     a = sub.add_parser("attach", help="supervise a running job")
-    a.add_argument("--name"); a.add_argument("--match"); a.add_argument("--pid")
+    a.add_argument("--name")
+    a.add_argument("--match")
+    a.add_argument("--pid")
     ag = a.add_mutually_exclusive_group()
     ag.add_argument("--restart-on-login", action="store_true",
                     help="reattach by pattern after login; --start may launch a new process")
     ag.add_argument("--persist", action="store_true", dest="restart_on_login",
                     help="deprecated alias for --restart-on-login")
-    a.add_argument("--cwd"); a.add_argument("--start")
+    a.add_argument("--cwd")
+    a.add_argument("--start")
     a.set_defaults(fn=cmd_attach)
 
     for nm, fn, hlp in [("status", cmd_status, "power/battery/temp/guards"),
@@ -667,25 +671,36 @@ def build_parser():
                          "compatibility alias for restart-persisted (does not restore RAM)"),
                         ("install-agent", cmd_install_agent, "restart configured jobs after reboot/login"),
                         ("uninstall-agent", cmd_uninstall_agent, "remove the login agent")]:
-        s = sub.add_parser(nm, help=hlp); s.set_defaults(fn=fn)
+        s = sub.add_parser(nm, help=hlp)
+        s.set_defaults(fn=fn)
 
     st = sub.add_parser("stop", help="stop supervising (unfreeze); --kill ends job")
-    st.add_argument("name"); st.add_argument("--kill", action="store_true"); st.set_defaults(fn=cmd_stop)
+    st.add_argument("name")
+    st.add_argument("--kill", action="store_true")
+    st.set_defaults(fn=cmd_stop)
 
-    up = sub.add_parser("unpersist", help="forget a persisted job"); up.add_argument("name"); up.set_defaults(fn=cmd_unpersist)
-    cf = sub.add_parser("config", help="show/init policy"); cf.add_argument("--init", action="store_true"); cf.set_defaults(fn=cmd_config)
+    up = sub.add_parser("unpersist", help="forget a persisted job")
+    up.add_argument("name")
+    up.set_defaults(fn=cmd_unpersist)
+    cf = sub.add_parser("config", help="show/init policy")
+    cf.add_argument("--init", action="store_true")
+    cf.set_defaults(fn=cmd_config)
     return p
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] == "__supervise":   # internal
-        return cmd_supervise(argv[1])
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if not getattr(args, "fn", None):
-        return cmd_status(args)
-    return args.fn(args)
+    try:
+        if argv and argv[0] == "__supervise":   # internal
+            return cmd_supervise(argv[1])
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        if not getattr(args, "fn", None):
+            return cmd_status(args)
+        return args.fn(args)
+    except ConfigError as exc:
+        sys.stderr.write(f"train-guard: {exc}\n")
+        return 2
 
 
 if __name__ == "__main__":

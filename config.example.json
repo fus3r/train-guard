@@ -1,12 +1,12 @@
 {
-  "poll": 20,
+  "poll": 20.0,
   "run_on_battery": false,
-  "battery_floor_pct": 30,
+  "battery_floor_pct": 30.0,
   "battery_band": "gentle",
   "ac_band": "full",
-  "temp_gentle_c": 38,
-  "temp_pause_c": 42,
-  "temp_resume_c": 36,
-  "charge_cool_until_pct": 80,
-  "temp_charge_gentle_c": 35
+  "temp_gentle_c": 38.0,
+  "temp_pause_c": 42.0,
+  "temp_resume_c": 36.0,
+  "charge_cool_until_pct": 80.0,
+  "temp_charge_gentle_c": 35.0
 }
