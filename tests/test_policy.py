@@ -53,6 +53,27 @@ def test_optional_battery_mode_obeys_floor(monkeypatch):
     assert cli.decide(cfg)[0] == "stop"
 
 
+def test_thermal_limit_overrides_allowed_battery_band(monkeypatch):
+    cfg = cli.load_config()
+    cfg.update(
+        run_on_battery=True,
+        battery_floor_pct=0,
+        battery_band="full",
+    )
+    set_readings(monkeypatch, source="Battery", percent=100, temp=42.0)
+
+    assert cli.decide(cfg)[0] == "stop"
+    assert cli._Cool.on is True
+
+
+def test_battery_band_is_used_before_ac_warm_rules(monkeypatch):
+    cfg = cli.load_config()
+    cfg.update(run_on_battery=True, battery_band="full")
+    set_readings(monkeypatch, source="Battery", percent=80, temp=38.0)
+
+    assert cli.decide(cfg)[0] == "full"
+
+
 def test_thermal_pause_has_hysteresis(monkeypatch):
     temperature = {"value": 42.0}
     set_readings(monkeypatch, temp=30.0)
@@ -70,6 +91,14 @@ def test_thermal_pause_has_hysteresis(monkeypatch):
     assert cli._Cool.on is False
 
 
+def test_missing_temperature_during_cooldown_keeps_job_paused(monkeypatch):
+    cli._Cool.on = True
+    set_readings(monkeypatch, temp=None)
+
+    assert cli.decide(cli.load_config())[0] == "stop"
+    assert cli._Cool.on is True
+
+
 @pytest.mark.parametrize(
     ("temperature", "expected"),
     [(37.9, "full"), (38.0, "gentle"), (41.9, "gentle"), (42.0, "stop")],
@@ -82,6 +111,22 @@ def test_ac_temperature_boundaries(monkeypatch, temperature, expected):
 def test_warm_low_charge_uses_gentle_mode(monkeypatch):
     set_readings(monkeypatch, percent=79, temp=35.0, charging=True)
     assert cli.decide(cli.load_config())[0] == "gentle"
+
+
+def test_warm_charging_rule_stops_at_charge_cutoff(monkeypatch):
+    set_readings(monkeypatch, percent=80, temp=35.0, charging=True)
+    assert cli.decide(cli.load_config())[0] == "full"
+
+
+def test_configured_bands_apply_when_no_higher_priority_rule_matches(monkeypatch):
+    cfg = cli.load_config()
+    cfg["ac_band"] = "gentle"
+    set_readings(monkeypatch, source="AC", percent=80, temp=30.0)
+    assert cli.decide(cfg)[0] == "gentle"
+
+    cfg.update(run_on_battery=True, battery_band="full")
+    set_readings(monkeypatch, source="Battery", percent=80, temp=30.0)
+    assert cli.decide(cfg)[0] == "full"
 
 
 def test_missing_temperature_skips_only_thermal_rules(monkeypatch):
