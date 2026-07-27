@@ -22,8 +22,12 @@ from pathlib import Path
 
 if __package__:
     from .config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
+    from .model import Observation, PowerSource
+    from .policy import PolicyEngine
 else:  # Keep direct execution from a checkout working.
     from config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
+    from model import Observation, PowerSource
+    from policy import PolicyEngine
 
 try:
     import psutil
@@ -147,44 +151,15 @@ def _apply(decision, procs):
             continue
 
 
-# Policy decision.
-class _Cool:
-    on = False  # thermal cooldown hysteresis state (per supervisor process)
-
-
-def decide(cfg: PolicyConfig):
-    src, pct, temp, chg = power_source(), battery_pct(), battery_temp_c(), is_charging()
-    tshow = "n/a" if temp is None else round(temp)
-    sig = f"power={src} batt={pct}% temp={tshow}C charging={'yes' if chg else 'no'}"
-    have_t = temp is not None
-
-    if _Cool.on:
-        if have_t and temp <= cfg.temp_resume_c:
-            _Cool.on = False
-        else:
-            return "stop", sig
-    if have_t and temp >= cfg.temp_pause_c:
-        _Cool.on = True
-        return "stop", sig
-
-    if src == "Battery":
-        if not cfg.run_on_battery:
-            return "stop", sig
-        if pct <= cfg.battery_floor_pct:
-            return "stop", sig
-        return ("gentle" if cfg.battery_band == "gentle" else "full"), sig
-
-    # on AC
-    if have_t and temp >= cfg.temp_gentle_c:
-        return "gentle", sig
-    if (
-        chg
-        and pct < cfg.charge_cool_until_pct
-        and have_t
-        and temp >= cfg.temp_charge_gentle_c
-    ):
-        return "gentle", sig
-    return ("gentle" if cfg.ac_band == "gentle" else "full"), sig
+# Policy input.
+def _observe() -> Observation:
+    """Collect the readings one policy evaluation is allowed to see."""
+    return Observation(
+        source=PowerSource.BATTERY if power_source() == "Battery" else PowerSource.AC,
+        percent=float(battery_pct()),
+        temperature_c=battery_temp_c(),
+        charging=is_charging(),
+    )
 
 
 # Process lookup.
@@ -275,6 +250,7 @@ def cmd_supervise(meta_path):
     detail = f"pattern={meta.get('pattern')}" if meta["mode"] == "attach" else f"jobpid={meta.get('jobpid')}"
     cfg = load_config()
     watcher = ConfigWatcher(CONFIGF, cfg)
+    engine = PolicyEngine()  # cooldown state belongs to this supervisor alone
     _glog(name, f"START mode={meta['mode']} {detail}")
     last, miss = None, 0
     while True:
@@ -320,11 +296,13 @@ def cmd_supervise(meta_path):
             time.sleep(cfg.poll)
             continue
         miss = 0
-        decision, sig = decide(cfg)
-        _apply(decision, procs)
-        line = f"{decision} | {sig}"
+        observation = _observe()
+        decision = engine.decide(cfg, observation)
+        action, sig = decision.action.value, observation.signature()
+        _apply(action, procs)
+        line = f"{action} {decision.reason.value} | {sig}"
         if line != last:
-            _glog(name, f"-> {decision}   ({sig})")
+            _glog(name, f"-> {action}   ({decision.reason.value}; {sig})")
             last = line
         time.sleep(cfg.poll)
 

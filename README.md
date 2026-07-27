@@ -135,9 +135,25 @@ guarantees a particular core class.
 ## Supervisor loop
 
 Every `poll` seconds, the supervisor reads power, charge and available
-temperature sensors. It selects `full`, `gentle` or `stop` for the process tree.
+temperature sensors, then evaluates one ordered list of rules and keeps the
+first match:
+
+1. an active thermal cooldown;
+2. the pause threshold `temp_pause_c`;
+3. the battery rules, in the order `run_on_battery`, `battery_floor_pct`,
+   `battery_band`;
+4. the warm-charging rule, below `charge_cool_until_pct` and at or above
+   `temp_charge_gentle_c`;
+5. the warm-AC rule at or above `temp_gentle_c`;
+6. `ac_band`.
+
+The match selects `full`, `gentle` or `stop` for the process tree and names the
+rule that produced it. The guard log records both whenever they change.
+
 Thermal pause has hysteresis: with the defaults, a job paused at 42 degrees
-stays paused until the pack reaches 36.
+stays paused until the pack reaches 36. A platform without a pack sensor skips
+the thermal rules, and a reading that disappears during a cooldown keeps the job
+paused rather than assuming the pack has cooled.
 
 Closing the lid needs no special path because the supervisor and worker sleep
 with the laptop. Login persistence creates a new process after reboot.

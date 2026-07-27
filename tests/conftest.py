@@ -14,8 +14,6 @@ def isolated_home(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "LOGDIR", tg_home / "logs")
     monkeypatch.setattr(cli, "PERSIST", tg_home / "persist")
     monkeypatch.setattr(cli, "CONFIGF", tg_home / "config.json")
-    cli._Cool.on = False
     cli._LINUX_AFFINITY.clear()
     yield
-    cli._Cool.on = False
     cli._LINUX_AFFINITY.clear()
