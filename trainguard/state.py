@@ -117,7 +117,12 @@ class AppPaths:
     @classmethod
     def from_environment(cls) -> "AppPaths":
         configured = os.environ.get("TRAIN_GUARD_HOME")
-        root = Path(configured or Path.home() / ".train-guard").expanduser().resolve()
+        root = Path(configured or Path.home() / ".train-guard").expanduser()
+        # Python 3.9 on Windows can leave a nonexistent relative path
+        # unresolved, so make the cwd relationship explicit first.
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        root = root.resolve()
         return cls(
             home=root,
             run=root / "run",
