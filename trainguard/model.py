@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Optional, Tuple
+
+
+def utc_now() -> str:
+    """Return an RFC 3339 timestamp in UTC, with milliseconds.
+
+    The documented poll interval can be set below one second, so a
+    whole-second stamp would give two different observations the same time.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class PowerSource(str, Enum):
     AC = "ac"
     BATTERY = "battery"
+    NO_BATTERY = "no_battery"
 
 
 class Action(str, Enum):
@@ -28,28 +39,34 @@ class DecisionReason(str, Enum):
     BATTERY_POLICY = "battery_policy"
     WARM_CHARGING = "warm_charging"
     WARM_AC = "warm_ac"
+    NO_BATTERY = "no_battery"
     AC_POLICY = "ac_policy"
 
 
 @dataclass(frozen=True)
 class Observation:
-    """One power and thermal sample handed to the policy.
+    """One internally consistent power and thermal sample.
 
-    ``temperature_c`` is optional because several supported platforms do not
-    expose a battery pack sensor.
+    Every field is read from a single battery snapshot, so the source, the
+    charge and the charging flag always describe the same instant. A missing
+    field is a measurement this host did not provide; it is never replaced by
+    a plausible-looking default, because a substituted value would silently
+    select a policy branch the hardware never justified. ``warnings`` carries
+    the reason each measurement is absent.
     """
 
     source: PowerSource
-    percent: float
+    percent: Optional[float]
     temperature_c: Optional[float]
-    charging: bool
+    charging: Optional[bool]
+    observed_at: str
+    warnings: Tuple[str, ...] = ()
 
     def signature(self) -> str:
-        temperature = "n/a" if self.temperature_c is None else f"{self.temperature_c:.0f}C"
-        return (
-            f"power={self.source.value} batt={self.percent:g}% "
-            f"temp={temperature} charging={'yes' if self.charging else 'no'}"
-        )
+        percent = "n/a" if self.percent is None else f"{self.percent:g}%"
+        temperature = "n/a" if self.temperature_c is None else f"{self.temperature_c:g}C"
+        charging = "n/a" if self.charging is None else ("yes" if self.charging else "no")
+        return f"power={self.source.value} batt={percent} temp={temperature} charging={charging}"
 
 
 @dataclass(frozen=True)

@@ -2,9 +2,8 @@ from dataclasses import replace
 
 import pytest
 
-from trainguard import cli
 from trainguard.config import PolicyConfig
-from trainguard.model import Action, DecisionReason, Observation, PowerSource
+from trainguard.model import Action, DecisionReason, Observation, PowerSource, utc_now
 from trainguard.policy import PolicyEngine
 
 DEFAULTS = PolicyConfig()
@@ -19,6 +18,7 @@ def sample(*, source=PowerSource.AC, percent=80.0, temperature=30.0, charging=Fa
         percent=percent,
         temperature_c=temperature,
         charging=charging,
+        observed_at=utc_now(),
     )
 
 
@@ -149,6 +149,42 @@ def test_missing_temperature_skips_only_the_thermal_rules():
     )
 
 
+def test_a_missing_charge_skips_only_the_rules_that_need_it():
+    """Losing the percentage must not cost the job its thermal protection."""
+    engine = PolicyEngine()
+
+    on_battery = engine.decide(
+        BATTERY_GENTLE, sample(source=PowerSource.BATTERY, percent=None, temperature=30.0)
+    )
+    while_charging = engine.decide(DEFAULTS, sample(percent=None, temperature=39.0, charging=True))
+
+    assert (on_battery.action, on_battery.reason) == (Action.GENTLE, DecisionReason.BATTERY_POLICY)
+    assert (while_charging.action, while_charging.reason) == (Action.GENTLE, DecisionReason.WARM_AC)
+
+
+@pytest.mark.parametrize(
+    ("temperature", "expected"),
+    [
+        (30.0, (Action.FULL, DecisionReason.NO_BATTERY)),
+        (39.0, (Action.GENTLE, DecisionReason.WARM_AC)),
+        (43.0, (Action.STOP, DecisionReason.THERMAL_LIMIT)),
+    ],
+)
+def test_a_host_without_a_battery_climbs_the_ac_thermal_ladder(temperature, expected):
+    """Only the reason reported at the foot of the ladder may differ from AC."""
+    decision = PolicyEngine().decide(
+        DEFAULTS,
+        sample(
+            source=PowerSource.NO_BATTERY,
+            percent=None,
+            temperature=temperature,
+            charging=None,
+        ),
+    )
+
+    assert (decision.action, decision.reason) == expected
+
+
 def test_each_engine_keeps_its_own_cooldown_state():
     """Two supervisors in one process must not share a thermal pause."""
     hot, cool = PolicyEngine(), PolicyEngine()
@@ -163,15 +199,7 @@ def test_each_engine_keeps_its_own_cooldown_state():
     assert still_cooling.reason is DecisionReason.THERMAL_COOLDOWN
 
 
-def test_observation_reports_what_the_sensors_returned(monkeypatch):
-    monkeypatch.setattr(cli, "power_source", lambda: "Battery")
-    monkeypatch.setattr(cli, "battery_pct", lambda: 55)
-    monkeypatch.setattr(cli, "battery_temp_c", lambda: 36.2)
-    monkeypatch.setattr(cli, "is_charging", lambda: False)
+def test_the_log_signature_reports_the_measured_values():
+    signature = sample(source=PowerSource.BATTERY, percent=55.0, temperature=36.2).signature()
 
-    observation = cli._observe()
-
-    assert observation == Observation(
-        source=PowerSource.BATTERY, percent=55.0, temperature_c=36.2, charging=False
-    )
-    assert observation.signature() == "power=battery batt=55% temp=36C charging=no"
+    assert signature == "power=battery batt=55% temp=36.2C charging=no"

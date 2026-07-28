@@ -38,9 +38,15 @@ class PolicyEngine:
         return PolicyDecision(action=action, reason=reason, cooling=self.cooling)
 
     def decide(self, config: PolicyConfig, observation: Observation) -> PolicyDecision:
-        """Evaluate the rules in a fixed order and return the first match."""
+        """Evaluate the rules in a fixed order and return the first match.
+
+        A measurement this host did not provide skips only the rules that
+        need it. The single exception is an active cooldown below, which no
+        absence of evidence may end.
+        """
 
         temperature = observation.temperature_c
+        percent = observation.percent
 
         # An active cooldown outranks everything: without a reading we cannot
         # prove the pack has cooled, so the job stays paused.
@@ -56,7 +62,7 @@ class PolicyEngine:
         if observation.source is PowerSource.BATTERY:
             if not config.run_on_battery:
                 return self._decide(Action.STOP, DecisionReason.BATTERY_DISABLED)
-            if observation.percent <= config.battery_floor_pct:
+            if percent is not None and percent <= config.battery_floor_pct:
                 return self._decide(Action.STOP, DecisionReason.BATTERY_FLOOR)
             return self._decide(Action(config.battery_band), DecisionReason.BATTERY_POLICY)
 
@@ -64,13 +70,20 @@ class PolicyEngine:
         # is the more specific one, so it names the reason when both match.
         if (
             observation.charging
-            and observation.percent < config.charge_cool_until_pct
+            and percent is not None
+            and percent < config.charge_cool_until_pct
             and temperature is not None
             and temperature >= config.temp_charge_gentle_c
         ):
             return self._decide(Action.GENTLE, DecisionReason.WARM_CHARGING)
 
+        # A host with no battery climbs the same thermal ladder as one on AC;
+        # only the reason it reports at the bottom of the ladder differs. A
+        # separate scale would make the documented rule order untrue for it.
         if temperature is not None and temperature >= config.temp_gentle_c:
             return self._decide(Action.GENTLE, DecisionReason.WARM_AC)
+
+        if observation.source is PowerSource.NO_BATTERY:
+            return self._decide(Action(config.ac_band), DecisionReason.NO_BATTERY)
 
         return self._decide(Action(config.ac_band), DecisionReason.AC_POLICY)

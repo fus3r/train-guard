@@ -20,20 +20,22 @@ import sys
 import time
 from pathlib import Path
 
-if __package__:
-    from .config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
-    from .model import Observation, PowerSource
-    from .policy import PolicyEngine
-else:  # Keep direct execution from a checkout working.
-    from config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
-    from model import Observation, PowerSource
-    from policy import PolicyEngine
-
 try:
     import psutil
 except ImportError:  # pragma: no cover
     sys.stderr.write("train-guard requires psutil:  pip install psutil\n")
     raise
+
+if __package__:
+    from .config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
+    from .model import PowerSource
+    from .policy import PolicyEngine
+    from .sensors import SensorReader
+else:  # Keep direct execution from a checkout working.
+    from config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
+    from model import PowerSource
+    from policy import PolicyEngine
+    from sensors import SensorReader
 
 __version__ = "0.2.0"
 SYSTEM = platform.system()  # 'Darwin' | 'Linux' | 'Windows'
@@ -60,49 +62,12 @@ def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-# Power and battery readings.
-def power_source():
-    b = psutil.sensors_battery()
-    if b is None:
-        return "AC"            # desktop or unknown, so never pause
-    return "AC" if b.power_plugged else "Battery"
-
-
-def battery_pct():
-    b = psutil.sensors_battery()
-    return int(b.percent) if b else 100
-
-
-def is_charging():
-    b = psutil.sensors_battery()
-    return bool(b and b.power_plugged and b.percent < 100)
-
-
-def battery_temp_c():
-    """Battery pack temperature in °C, or None if unavailable on this platform."""
-    try:
-        if SYSTEM == "Darwin":
-            out = subprocess.run(["ioreg", "-rn", "AppleSmartBattery", "-w0"],
-                                 capture_output=True, text=True, timeout=5).stdout
-            m = re.search(r'"Temperature"\s*=\s*(\d+)', out)
-            if m:
-                return int(m.group(1)) / 100.0
-        elif SYSTEM == "Linux":
-            temps = getattr(psutil, "sensors_temperatures", lambda: {})() or {}
-            for name, entries in temps.items():
-                if "bat" in name.lower():
-                    for e in entries:
-                        if e.current:
-                            return float(e.current)
-            for p in Path("/sys/class/power_supply").glob("BAT*/temp"):
-                try:
-                    return int(p.read_text().strip()) / 10.0
-                except Exception:
-                    pass
-        # Windows usually needs vendor tools for battery temperature.
-    except Exception:
-        return None
-    return None
+# How a power source is named in the status report.
+_SOURCE_LABELS = {
+    PowerSource.AC: "AC",
+    PowerSource.BATTERY: "Battery",
+    PowerSource.NO_BATTERY: "no battery exposed (treated as AC)",
+}
 
 
 # Process control.
@@ -149,17 +114,6 @@ def _apply(decision, procs):
                 _set_band(p, decision)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-
-
-# Policy input.
-def _observe() -> Observation:
-    """Collect the readings one policy evaluation is allowed to see."""
-    return Observation(
-        source=PowerSource.BATTERY if power_source() == "Battery" else PowerSource.AC,
-        percent=float(battery_pct()),
-        temperature_c=battery_temp_c(),
-        charging=is_charging(),
-    )
 
 
 # Process lookup.
@@ -251,8 +205,9 @@ def cmd_supervise(meta_path):
     cfg = load_config()
     watcher = ConfigWatcher(CONFIGF, cfg)
     engine = PolicyEngine()  # cooldown state belongs to this supervisor alone
+    reader = SensorReader()
     _glog(name, f"START mode={meta['mode']} {detail}")
-    last, miss = None, 0
+    last, warned, miss = None, (), 0
     while True:
         stopf = RUNDIR / f"{name}.stop"
         if stopf.exists():
@@ -296,7 +251,11 @@ def cmd_supervise(meta_path):
             time.sleep(cfg.poll)
             continue
         miss = 0
-        observation = _observe()
+        observation = reader.sample()
+        if observation.warnings != warned:
+            for warning in observation.warnings:
+                _glog(name, f"SENSOR {warning}")
+            warned = observation.warnings
         decision = engine.decide(cfg, observation)
         action, sig = decision.action.value, observation.signature()
         _apply(action, procs)
@@ -410,10 +369,18 @@ def _agent_installed():
 def cmd_status(args):
     _ensure_dirs()
     cfg = load_config()
-    src, pct, temp, chg = power_source(), battery_pct(), battery_temp_c(), is_charging()
+    obs = SensorReader().sample()
     print("power / battery")
+    temp = obs.temperature_c
     tshow = "n/a (not exposed on this OS)" if temp is None else f"{temp:.1f}°C"
-    print(f"  source: {src}   charge: {pct}%   charging: {'yes' if chg else 'no'}   pack temp: {tshow}")
+    pct = "n/a" if obs.percent is None else f"{obs.percent:g}%"
+    chg = "n/a" if obs.charging is None else ("yes" if obs.charging else "no")
+    print(
+        f"  source: {_SOURCE_LABELS[obs.source]}   charge: {pct}   "
+        f"charging: {chg}   pack temp: {tshow}"
+    )
+    for warning in obs.warnings:
+        print(f"  note: {warning}")
     if SYSTEM == "Darwin":
         try:
             sp = subprocess.run(["system_profiler", "SPPowerDataType"], capture_output=True, text=True, timeout=10).stdout

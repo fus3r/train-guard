@@ -134,9 +134,9 @@ guarantees a particular core class.
 
 ## Supervisor loop
 
-Every `poll` seconds, the supervisor reads power, charge and available
-temperature sensors, then evaluates one ordered list of rules and keeps the
-first match:
+Every `poll` seconds, the supervisor takes one battery snapshot, reads the pack
+temperature when the platform exposes it, then evaluates one ordered list of
+rules and keeps the first match:
 
 1. an active thermal cooldown;
 2. the pause threshold `temp_pause_c`;
@@ -145,15 +145,36 @@ first match:
 4. the warm-charging rule, below `charge_cool_until_pct` and at or above
    `temp_charge_gentle_c`;
 5. the warm-AC rule at or above `temp_gentle_c`;
-6. `ac_band`.
+6. `ac_band`, reported as `no_battery` on a host that exposes no battery.
 
 The match selects `full`, `gentle` or `stop` for the process tree and names the
 rule that produced it. The guard log records both whenever they change.
 
 Thermal pause has hysteresis: with the defaults, a job paused at 42 degrees
-stays paused until the pack reaches 36. A platform without a pack sensor skips
-the thermal rules, and a reading that disappears during a cooldown keeps the job
-paused rather than assuming the pack has cooled.
+stays paused until the pack reaches 36.
+
+### What one observation contains
+
+Power source, charge and charging state come from a single battery snapshot, so
+a decision never mixes a plugged-in reading with a charge read after the cable
+was pulled. Each observation is stamped in UTC to the millisecond, because
+`poll` may be set below one second.
+
+`charging` is a portable inference, plugged in and below 100 percent. It is not
+a charge-current measurement, because the cross-platform battery API does not
+expose one.
+
+A measurement this host does not provide stays absent instead of being replaced
+by a plausible default, and the guard log records why it is missing. An absent
+measurement skips only the rules that need it: a host with no battery at all is
+treated as mains-powered and climbs the same thermal ladder as AC. The one
+exception is an active thermal cooldown, which a reading that disappears cannot
+end.
+
+On Linux, `power_supply/*/temp` is read as tenths of a degree, the unit that
+interface defines, so a cool pack reporting `45` is 4.5 °C. A temperature that
+arrives through psutil carries no guaranteed scale, so only there is a value
+too large for a battery pack rescaled.
 
 Closing the lid needs no special path because the supervisor and worker sleep
 with the laptop. Login persistence creates a new process after reboot.

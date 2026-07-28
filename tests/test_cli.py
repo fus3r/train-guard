@@ -4,6 +4,21 @@ from types import SimpleNamespace
 import pytest
 
 from trainguard import cli
+from trainguard.model import Observation, PowerSource, utc_now
+
+
+def pin_sensors(monkeypatch, **readings):
+    """Report one fixed observation instead of this machine's battery."""
+    observation = Observation(
+        source=readings.get("source", PowerSource.AC),
+        percent=readings.get("percent", 100.0),
+        temperature_c=readings.get("temperature_c"),
+        charging=readings.get("charging", False),
+        observed_at=utc_now(),
+        warnings=readings.get("warnings", ()),
+    )
+    reader = SimpleNamespace(sample=lambda: observation)
+    monkeypatch.setattr(cli, "SensorReader", lambda *args, **kwargs: reader)
 
 
 @pytest.fixture
@@ -74,10 +89,7 @@ def test_restart_persisted_relaunches_as_a_fresh_process(fake_spawn, capsys, tmp
 
 
 def test_status_names_restart_semantics(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "power_source", lambda: "AC")
-    monkeypatch.setattr(cli, "battery_pct", lambda: 100)
-    monkeypatch.setattr(cli, "battery_temp_c", lambda: None)
-    monkeypatch.setattr(cli, "is_charging", lambda: False)
+    pin_sensors(monkeypatch)
     monkeypatch.setattr(cli, "_agent_installed", lambda: False)
 
     assert cli.main(["status"]) == 0
@@ -85,6 +97,25 @@ def test_status_names_restart_semantics(monkeypatch, capsys):
     assert "starts a new process" in output
     assert "RAM state cannot survive a reboot" in output
     assert "35°C" in output and "38°C" in output and "42°C" in output
+
+
+def test_status_shows_missing_readings_instead_of_defaults(monkeypatch, capsys):
+    """A host with no battery used to be reported as a full charge."""
+    pin_sensors(
+        monkeypatch,
+        source=PowerSource.NO_BATTERY,
+        percent=None,
+        charging=None,
+        warnings=("battery not exposed; treating this host as mains-powered",),
+    )
+    monkeypatch.setattr(cli, "SYSTEM", "Linux")
+    monkeypatch.setattr(cli, "_agent_installed", lambda: False)
+
+    assert cli.main(["status"]) == 0
+    output = capsys.readouterr().out
+    assert "charge: n/a" in output
+    assert "charging: n/a" in output
+    assert "note: battery not exposed" in output
 
 
 def test_config_init_creates_its_parent(capsys):

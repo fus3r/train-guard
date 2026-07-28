@@ -70,27 +70,6 @@ def test_windows_gentle_uses_idle_priority(monkeypatch):
     assert proc.nice_calls == [64]
 
 
-def test_macos_battery_temperature_adapter(monkeypatch):
-    monkeypatch.setattr(cli, "SYSTEM", "Darwin")
-    result = subprocess.CompletedProcess([], 0, stdout='"Temperature" = 3650\n', stderr="")
-    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: result)
-    assert cli.battery_temp_c() == 36.5
-
-
-def test_linux_battery_temperature_adapter(monkeypatch):
-    sensor = SimpleSensor(current=37.25)
-    monkeypatch.setattr(cli, "SYSTEM", "Linux")
-    monkeypatch.setattr(
-        cli.psutil, "sensors_temperatures", lambda: {"battery": [sensor]}, raising=False
-    )
-    assert cli.battery_temp_c() == 37.25
-
-
-class SimpleSensor:
-    def __init__(self, current):
-        self.current = current
-
-
 def wait_for_counter(path, predicate, timeout=5):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
