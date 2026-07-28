@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 
 def utc_now() -> str:
@@ -76,3 +77,40 @@ class PolicyDecision:
     action: Action
     reason: DecisionReason
     cooling: bool
+
+
+@dataclass(frozen=True, order=True)
+class ProcessIdentity:
+    """A process identifier suitable for validated on-disk state.
+
+    Keeping both fields strict prevents ambiguous recovery data from entering
+    the state directory.
+    """
+
+    pid: int
+    create_time: float
+
+    def __post_init__(self) -> None:
+        if isinstance(self.pid, bool) or not isinstance(self.pid, int) or self.pid <= 0:
+            raise ValueError("process pid must be a positive integer")
+        if (
+            isinstance(self.create_time, bool)
+            or not isinstance(self.create_time, (int, float))
+            or not math.isfinite(float(self.create_time))
+            or self.create_time <= 0
+        ):
+            raise ValueError("process create_time must be a positive finite number")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"pid": self.pid, "create_time": self.create_time}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ProcessIdentity":
+        if not isinstance(value, dict):
+            raise ValueError("process identity must be an object")
+        try:
+            pid = value["pid"]
+            create_time = value["create_time"]
+        except KeyError as exc:
+            raise ValueError(f"process identity is missing {exc.args[0]}") from exc
+        return cls(pid=pid, create_time=create_time)

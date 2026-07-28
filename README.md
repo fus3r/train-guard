@@ -179,6 +179,26 @@ too large for a battery pack rescaled.
 Closing the lid needs no special path because the supervisor and worker sleep
 with the laptop. Login persistence creates a new process after reboot.
 
+## Local state
+
+State lives under `~/.train-guard` by default. Set `TRAIN_GUARD_HOME` to move
+it; relative values are resolved before a detached supervisor starts, so the
+parent and child keep using the same directory.
+
+Job names are limited to 1–64 letters, digits, dots, underscores or hyphens.
+Path components and Windows device names such as `con`, `nul` and `com1` are
+rejected before a worker starts.
+
+Metadata, supervisor identity and current runtime state use separate,
+schema-versioned JSON files under `run/`. Writes are flushed to a temporary file
+and atomically replace the prior value; non-finite JSON numbers are rejected.
+An advisory `<name>.lock` also prevents two commands from creating the same job
+at once. The lock file remains in place for reuse.
+
+Malformed state is reported by `status` rather than guessed or deleted. A
+runtime record left without its metadata is likewise preserved and blocks a
+new job from silently adopting the same name.
+
 ## Tests
 
 ```bash

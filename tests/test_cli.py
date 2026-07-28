@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from trainguard import cli
-from trainguard.model import Observation, PowerSource, utc_now
+from trainguard.model import Observation, PowerSource, ProcessIdentity, utc_now
 
 
 def pin_sensors(monkeypatch, **readings):
@@ -30,6 +30,11 @@ def fake_spawn(monkeypatch):
         return SimpleNamespace(pid=5000 + len(calls))
 
     monkeypatch.setattr(cli, "_spawn_detached", spawn)
+    monkeypatch.setattr(
+        cli,
+        "_capture_identity",
+        lambda pid, _label: ProcessIdentity(pid, float(pid)),
+    )
     return calls
 
 

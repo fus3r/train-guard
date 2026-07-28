@@ -28,34 +28,77 @@ except ImportError:  # pragma: no cover
 
 if __package__:
     from .config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
-    from .model import PowerSource
+    from .model import PowerSource, ProcessIdentity, utc_now
     from .policy import PolicyEngine
     from .sensors import SensorReader
+    from .state import (
+        AppPaths,
+        JobSpec,
+        JobStore,
+        PersistenceSpec,
+        StateError,
+        atomic_json_write,
+        validate_job_name,
+    )
 else:  # Keep direct execution from a checkout working.
     from config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
-    from model import PowerSource
+    from model import PowerSource, ProcessIdentity, utc_now
     from policy import PolicyEngine
     from sensors import SensorReader
+    from state import (
+        AppPaths,
+        JobSpec,
+        JobStore,
+        PersistenceSpec,
+        StateError,
+        atomic_json_write,
+        validate_job_name,
+    )
 
 __version__ = "0.2.0"
 SYSTEM = platform.system()  # 'Darwin' | 'Linux' | 'Windows'
 HOME = Path.home()
-TG_HOME = Path(os.environ.get("TRAIN_GUARD_HOME", HOME / ".train-guard"))
-RUNDIR, LOGDIR, PERSIST = TG_HOME / "run", TG_HOME / "logs", TG_HOME / "persist"
-CONFIGF = TG_HOME / "config.json"
+_INITIAL_PATHS = AppPaths.from_environment()
+TG_HOME = _INITIAL_PATHS.home
+RUNDIR, LOGDIR, PERSIST = (
+    _INITIAL_PATHS.run,
+    _INITIAL_PATHS.logs,
+    _INITIAL_PATHS.persist,
+)
+CONFIGF = _INITIAL_PATHS.config
 
 # Linux niceness cannot normally be raised back to its original value by an
 # unprivileged process. Keep a reversible CPU-affinity snapshot instead.
 _LINUX_AFFINITY = {}
 
 
-def _ensure_dirs():
-    for d in (RUNDIR, LOGDIR, PERSIST):
-        d.mkdir(parents=True, exist_ok=True)
+def _sync_path_aliases(paths: AppPaths) -> None:
+    """Keep the v0.2 module constants available to callers and tests."""
+
+    global TG_HOME, RUNDIR, LOGDIR, PERSIST, CONFIGF
+    TG_HOME = paths.home
+    RUNDIR = paths.run
+    LOGDIR = paths.logs
+    PERSIST = paths.persist
+    CONFIGF = paths.config
+
+
+def _paths() -> AppPaths:
+    paths = AppPaths.from_environment()
+    # A detached child can use another cwd. Exporting the absolute value keeps
+    # parent and supervisor on the same state directory.
+    os.environ["TRAIN_GUARD_HOME"] = str(paths.home)
+    paths.ensure()
+    _sync_path_aliases(paths)
+    return paths
+
+
+def _ensure_dirs() -> None:
+    _paths()
 
 
 def load_config() -> PolicyConfig:
-    return load_policy(CONFIGF)
+    return load_policy(_paths().config)
 
 
 def _now():
@@ -173,6 +216,48 @@ def _alive(pid):
     return pid is not None and psutil.pid_exists(pid)
 
 
+def _capture_identity(pid, label):
+    try:
+        process = psutil.Process(pid)
+        return ProcessIdentity(pid=process.pid, create_time=process.create_time())
+    except psutil.NoSuchProcess as exc:
+        raise StateError(f"{label} process {pid} does not exist") from exc
+    except psutil.AccessDenied as exc:
+        raise StateError(f"cannot inspect {label} process {pid}") from exc
+
+
+def _guard_pid(store, name):
+    identity = store.read_guard(name)
+    if identity is not None:
+        return identity.pid
+    return _read_pid(store.legacy_guard_path(name))
+
+
+def _ensure_name_available(store, name):
+    validate_job_name(name)
+    if store.spec_path(name).exists():
+        guard_pid = _guard_pid(store, name)
+        if _alive(guard_pid):
+            raise StateError(f"a guard named '{name}' is already active")
+        raise StateError(
+            f"guard '{name}' has stale state; inspect it with `train-guard status` "
+            "before reusing this name"
+        )
+
+    guard_pid = _guard_pid(store, name)
+    if _alive(guard_pid):
+        raise StateError(
+            f"guard '{name}' has a live supervisor but no job metadata; "
+            "stop that process or choose another name"
+        )
+    if store.runtime_path(name).exists():
+        raise StateError(
+            f"guard '{name}' has recovery state but no job metadata; "
+            "inspect it with `train-guard status` before reusing this name"
+        )
+    store.remove_guard_state(name)
+
+
 def _glog(name, msg):
     LOGDIR.mkdir(parents=True, exist_ok=True)
     with open(LOGDIR / f"{name}.guard.log", "a") as f:
@@ -193,25 +278,63 @@ def _spawn_detached(args, logfile=None, cwd=None):
             out.close()
 
 
-def _supervisor_argv(meta_path):
-    return [sys.executable, str(Path(__file__).resolve()), "__supervise", str(meta_path)]
+def _supervisor_argv(name):
+    return [sys.executable, str(Path(__file__).resolve()), "__supervise", name]
+
+
+def _runtime_payload(state, cooling, pids, observation=None, decision=None, config_error=None):
+    payload = {
+        "schema_version": 1,
+        "updated_at": utc_now(),
+        "state": state,
+        "cooling": cooling,
+        # Empty, explicit ownership fields keep the recovery schema unambiguous
+        # without claiming ownership the current controller cannot yet prove.
+        "owned_suspensions": [],
+        "tuned_processes": [],
+        "pids": sorted({int(pid) for pid in pids}),
+    }
+    if observation is not None:
+        payload["observation"] = {
+            "source": observation.source.value,
+            "percent": observation.percent,
+            "temperature_c": observation.temperature_c,
+            "charging": observation.charging,
+            "observed_at": observation.observed_at,
+            "warnings": list(observation.warnings),
+        }
+    if decision is not None:
+        payload["decision"] = {
+            "action": decision.action.value,
+            "reason": decision.reason.value,
+            "cooling": decision.cooling,
+        }
+    if config_error:
+        payload["config_error"] = config_error
+    return payload
 
 
 # Supervisor loop.
-def cmd_supervise(meta_path):
-    meta = json.loads(Path(meta_path).read_text())
-    name = meta["name"]
-    detail = f"pattern={meta.get('pattern')}" if meta["mode"] == "attach" else f"jobpid={meta.get('jobpid')}"
-    cfg = load_config()
-    watcher = ConfigWatcher(CONFIGF, cfg)
+def cmd_supervise(name):
+    paths = _paths()
+    store = JobStore(paths)
+    spec = store.read_spec(name)
+    meta = spec.to_dict()
+    detail = (
+        f"pattern={meta.get('pattern')}"
+        if meta["mode"] == "attach"
+        else f"jobpid={meta.get('jobpid')}"
+    )
+    cfg = load_policy(paths.config)
+    watcher = ConfigWatcher(paths.config, cfg)
     engine = PolicyEngine()  # cooldown state belongs to this supervisor alone
     reader = SensorReader()
     _glog(name, f"START mode={meta['mode']} {detail}")
     last, warned, miss = None, (), 0
+    store.write_runtime(name, _runtime_payload("starting", False, []))
     while True:
-        stopf = RUNDIR / f"{name}.stop"
-        if stopf.exists():
-            how = stopf.read_text().strip()
+        how = store.read_stop(name)
+        if how is not None:
             procs = _targets(meta)
             _apply("full", procs)
             if how == "kill":
@@ -223,19 +346,11 @@ def cmd_supervise(meta_path):
                 _glog(name, "STOP --kill: terminated job")
             else:
                 _glog(name, "STOP: unfroze job, detaching")
-            for f in (stopf, RUNDIR / f"{name}.meta.json", RUNDIR / f"{name}.gpid"):
-                try:
-                    f.unlink()
-                except FileNotFoundError:
-                    pass
+            store.remove_active_state(name)
             return
         if meta["mode"] == "run" and not psutil.pid_exists(meta["jobpid"]):
             _glog(name, "job exited; guard done")
-            for f in (RUNDIR / f"{name}.meta.json", RUNDIR / f"{name}.gpid"):
-                try:
-                    f.unlink()
-                except FileNotFoundError:
-                    pass
+            store.remove_active_state(name)
             return
         cfg, config_changed, config_error = watcher.poll()
         if config_changed:
@@ -248,6 +363,15 @@ def cmd_supervise(meta_path):
             miss += 1
             if miss % 15 == 1:
                 _glog(name, "no process matches pattern yet (waiting)")
+            store.write_runtime(
+                name,
+                _runtime_payload(
+                    "waiting",
+                    engine.cooling,
+                    [],
+                    config_error=config_error,
+                ),
+            )
             time.sleep(cfg.poll)
             continue
         miss = 0
@@ -259,6 +383,17 @@ def cmd_supervise(meta_path):
         decision = engine.decide(cfg, observation)
         action, sig = decision.action.value, observation.signature()
         _apply(action, procs)
+        store.write_runtime(
+            name,
+            _runtime_payload(
+                action,
+                decision.cooling,
+                [proc.pid for proc in procs],
+                observation=observation,
+                decision=decision,
+                config_error=config_error,
+            ),
+        )
         line = f"{action} {decision.reason.value} | {sig}"
         if line != last:
             _glog(name, f"-> {action}   ({decision.reason.value}; {sig})")
@@ -282,30 +417,36 @@ def _restart_on_login(args):
 
 
 def cmd_run(args):
-    _ensure_dirs()
-    cfg = load_config()
+    paths = _paths()
+    store = JobStore(paths)
+    cfg = load_policy(paths.config)
     cmd = list(args.cmd or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
         sys.stderr.write("usage: train-guard run [--name N] [--restart-on-login] [--cwd DIR] -- <command...>\n")
         return 2
-    name = args.name or f"job-{time.strftime('%H%M%S')}"
-    metaf, gpidf = RUNDIR / f"{name}.meta.json", RUNDIR / f"{name}.gpid"
-    if metaf.exists() and _alive(_read_pid(gpidf)):
-        sys.stderr.write(f"a guard named '{name}' is already active\n")
-        return 1
+    name = validate_job_name(args.name or f"job-{time.strftime('%H%M%S')}")
     cwd = args.cwd or os.getcwd()
     restart = _restart_on_login(args)
-    if restart:
-        (PERSIST / f"{name}.job").write_text(json.dumps(
-            {"mode": "run", "name": name, "cwd": cwd, "argv": cmd,
-             "reboot_semantics": "restart-command"}))
-    log = LOGDIR / f"{name}.log"
-    job = _spawn_detached(cmd, logfile=log, cwd=cwd)
-    metaf.write_text(json.dumps({"mode": "run", "name": name, "jobpid": job.pid, "log": str(log)}))
-    sup = _spawn_detached(_supervisor_argv(metaf))
-    gpidf.write_text(str(sup.pid))
+    log = paths.logs / f"{name}.log"
+    with store.lock_name(name):
+        _ensure_name_available(store, name)
+        if restart:
+            store.write_persistence(
+                PersistenceSpec(
+                    mode="run",
+                    name=name,
+                    cwd=cwd,
+                    argv=tuple(cmd),
+                )
+            )
+        job = _spawn_detached(cmd, logfile=log, cwd=cwd)
+        root = _capture_identity(job.pid, "job")
+        store.write_spec(JobSpec.launched(name, root, log))
+        sup = _spawn_detached(_supervisor_argv(name))
+        guard = _capture_identity(sup.pid, "supervisor")
+        store.write_guard(name, guard)
     tag = "  (restarts at next login)" if restart else ""
     print(f"[train-guard] '{name}': job pid={job.pid}  guard pid={sup.pid}  out={log}{tag}")
     print(f"[train-guard] policy: {_policy_line(cfg)}   |   train-guard status")
@@ -313,8 +454,9 @@ def cmd_run(args):
 
 
 def cmd_attach(args):
-    _ensure_dirs()
-    cfg = load_config()
+    paths = _paths()
+    store = JobStore(paths)
+    cfg = load_policy(paths.config)
     if not args.match and not args.pid:
         sys.stderr.write('usage: train-guard attach --match "<pattern>" [--name N] [--restart-on-login --start "<cmd>"]   (or --pid PID)\n')
         return 2
@@ -322,23 +464,28 @@ def cmd_attach(args):
     if args.pid and restart:
         sys.stderr.write("attach: a PID cannot survive a reboot; use --match with --restart-on-login and optionally --start\n")
         return 2
-    name = args.name or f"attach-{time.strftime('%H%M%S')}"
-    metaf, gpidf = RUNDIR / f"{name}.meta.json", RUNDIR / f"{name}.gpid"
-    if metaf.exists() and _alive(_read_pid(gpidf)):
-        sys.stderr.write(f"a guard named '{name}' is already active\n")
-        return 1
+    name = validate_job_name(args.name or f"attach-{time.strftime('%H%M%S')}")
     cwd = args.cwd or os.getcwd()
     if args.pid:
-        meta = {"mode": "run", "name": name, "jobpid": int(args.pid)}
+        spec = JobSpec.attached_pid(name, _capture_identity(int(args.pid), "attached"))
     else:
-        meta = {"mode": "attach", "name": name, "pattern": args.match}
+        spec = JobSpec.attached_pattern(name, args.match)
+    with store.lock_name(name):
+        _ensure_name_available(store, name)
+        store.write_spec(spec)
         if restart:
-            (PERSIST / f"{name}.job").write_text(json.dumps(
-                {"mode": "attach", "name": name, "cwd": cwd, "pattern": args.match,
-                 "start": args.start or "", "reboot_semantics": "restart-or-reattach"}))
-    metaf.write_text(json.dumps(meta))
-    sup = _spawn_detached(_supervisor_argv(metaf))
-    gpidf.write_text(str(sup.pid))
+            store.write_persistence(
+                PersistenceSpec(
+                    mode="attach",
+                    name=name,
+                    cwd=cwd,
+                    pattern=args.match,
+                    start=args.start,
+                )
+            )
+        sup = _spawn_detached(_supervisor_argv(name))
+        guard = _capture_identity(sup.pid, "supervisor")
+        store.write_guard(name, guard)
     tag = "  (restart/reattach configured for next login)" if restart else ""
     print(f"[train-guard] attached '{name}'  guard pid={sup.pid}{tag}")
     print(f"[train-guard] policy: {_policy_line(cfg)}   |   train-guard status")
@@ -367,8 +514,9 @@ def _agent_installed():
 
 
 def cmd_status(args):
-    _ensure_dirs()
-    cfg = load_config()
+    paths = _paths()
+    store = JobStore(paths)
+    cfg = load_policy(paths.config)
     obs = SensorReader().sample()
     print("power / battery")
     temp = obs.temperature_c
@@ -401,16 +549,15 @@ def cmd_status(args):
     )
     print()
     print("active guards")
-    metas = sorted(RUNDIR.glob("*.meta.json"))
-    if not metas:
+    specs = store.list_specs()
+    if not specs:
         print("  (none)")
-    for mf in metas:
+    for spec in specs:
+        meta = spec.to_dict()
         try:
-            meta = json.loads(mf.read_text())
-        except Exception:
-            continue
-        name = meta["name"]
-        gp = _read_pid(RUNDIR / f"{name}.gpid")
+            gp = _guard_pid(store, spec.name)
+        except StateError:
+            gp = None
         alive = "running" if _alive(gp) else "dead"
         procs = _targets(meta)
         if procs:
@@ -418,48 +565,56 @@ def cmd_status(args):
             worker = f"{st}  ({len(procs)} proc)"
         else:
             worker = "none right now"
-        print(f"  {name} [{meta['mode']}]  guard={alive} (pid {gp})   worker: {worker}")
+        print(
+            f"  {spec.name} [{spec.mode}]  guard={alive} (pid {gp})   "
+            f"worker: {worker}"
+        )
+    state_errors = store.audit_state()
+    if state_errors:
+        print()
+        print("state issues")
+        for error in state_errors:
+            print(f"  ! {error}")
     print()
     print("restart after reboot (starts a new process; RAM state cannot survive a reboot)")
     print(f"  login agent: {'INSTALLED' if _agent_installed() else 'not installed  ->  train-guard install-agent'}")
-    pj = sorted(PERSIST.glob("*.job"))
+    pj = sorted(paths.persist.glob("*.job"))
     print("  restart specs: " + (", ".join(p.stem for p in pj) if pj else "none (add --restart-on-login to run/attach)"))
     return 0
 
 
 def cmd_list(args):
-    metas = sorted(RUNDIR.glob("*.meta.json"))
-    print("\n".join(m.stem.replace(".meta", "") for m in metas) if metas else "(no active guards)")
+    store = JobStore(_paths())
+    specs = store.list_specs()
+    print("\n".join(spec.name for spec in specs) if specs else "(no active guards)")
     return 0
 
 
 def cmd_stop(args):
-    name = args.name
-    if not (RUNDIR / f"{name}.meta.json").exists():
+    store = JobStore(_paths())
+    name = validate_job_name(args.name)
+    if not store.spec_path(name).exists():
         sys.stderr.write(f"no active guard named '{name}' (train-guard list)\n")
         return 1
-    (RUNDIR / f"{name}.stop").write_text("kill" if args.kill else "soft")
-    try:
-        (PERSIST / f"{name}.job").unlink()
-    except FileNotFoundError:
-        pass
+    store.request_stop(name, args.kill)
+    store.remove_persistence(name)
     print(f"[train-guard] stop requested for '{name}'" + (" (--kill the job)" if args.kill else "") +
           "; unfreezes & detaches within one poll. (login restart removed)")
     return 0
 
 
 def cmd_config(args):
-    _ensure_dirs()
+    paths = _paths()
     defaults = PolicyConfig().to_dict()
     if getattr(args, "init", False):
-        CONFIGF.write_text(json.dumps(defaults, indent=2), encoding="utf-8")
-    cfg = load_config()
-    print(f"policy: {CONFIGF}\n")
+        atomic_json_write(paths.config, defaults)
+    cfg = load_policy(paths.config)
+    print(f"policy: {paths.config}\n")
     print(json.dumps(cfg.to_dict(), indent=2))
-    if not CONFIGF.exists():
+    if not paths.config.exists():
         print("\n(no config.json yet; defaults shown. run `train-guard config --init` to write it)")
     if getattr(args, "init", False):
-        print(f"\nwrote {CONFIGF}")
+        print(f"\nwrote {paths.config}")
     return 0
 
 
@@ -470,29 +625,25 @@ def cmd_restart_persisted(args):
     destroys RAM, so a ``run`` spec starts the command as a fresh process. Jobs
     that can checkpoint may continue from their own last durable checkpoint.
     """
-    _ensure_dirs()
-    load_config()
-    for jf in sorted(PERSIST.glob("*.job")):
-        try:
-            j = json.loads(jf.read_text())
-        except Exception:
-            continue
-        name = j.get("name")
-        if not name:
-            continue
-        if (RUNDIR / f"{name}.meta.json").exists() and _alive(_read_pid(RUNDIR / f"{name}.gpid")):
+    paths = _paths()
+    store = JobStore(paths)
+    load_policy(paths.config)
+    persisted = list(store.list_persistence())
+    for _path, spec in persisted:
+        name = spec.name
+        if store.spec_path(name).exists() and _alive(_guard_pid(store, name)):
             print(f"[restart] '{name}' already active; skipping")
             continue
-        if j["mode"] == "run":
+        if spec.mode == "run":
             cmd_run(argparse.Namespace(name=name, restart_on_login=True,
-                                       cwd=j.get("cwd"), cmd=j["argv"]))
+                                       cwd=spec.cwd, cmd=list(spec.argv)))
         else:
-            pat, start = j["pattern"], j.get("start") or ""
+            pat, start = spec.pattern, spec.start or ""
             if start and not _pattern_running(pat):
                 shell = ["cmd", "/c", start] if os.name == "nt" else ["/bin/sh", "-c", start]
-                _spawn_detached(shell, logfile=LOGDIR / f"{name}.start.log", cwd=j.get("cwd"))
+                _spawn_detached(shell, logfile=paths.logs / f"{name}.start.log", cwd=spec.cwd)
                 print(f"[restart] started job for '{name}': {start}")
-            cmd_attach(argparse.Namespace(name=name, restart_on_login=True, cwd=j.get("cwd"),
+            cmd_attach(argparse.Namespace(name=name, restart_on_login=True, cwd=spec.cwd,
                                           match=pat, pid=None, start=start))
     print("[restart] done (commands were restarted or reattached; no RAM state was restored)")
     return 0
@@ -503,12 +654,10 @@ cmd_resume = cmd_restart_persisted
 
 
 def cmd_unpersist(args):
-    for ext in (".job",):
-        try:
-            (PERSIST / f"{args.name}{ext}").unlink()
-        except FileNotFoundError:
-            pass
-    print(f"[train-guard] '{args.name}' will no longer restart or reattach at login")
+    store = JobStore(_paths())
+    name = validate_job_name(args.name)
+    store.remove_persistence(name)
+    print(f"[train-guard] '{name}' will no longer restart or reattach at login")
     return 0
 
 
@@ -598,7 +747,7 @@ def build_parser():
     a = sub.add_parser("attach", help="supervise a running job")
     a.add_argument("--name")
     a.add_argument("--match")
-    a.add_argument("--pid")
+    a.add_argument("--pid", type=int)
     ag = a.add_mutually_exclusive_group()
     ag.add_argument("--restart-on-login", action="store_true",
                     help="reattach by pattern after login; --start may launch a new process")
@@ -643,7 +792,7 @@ def main(argv=None):
         if not getattr(args, "fn", None):
             return cmd_status(args)
         return args.fn(args)
-    except ConfigError as exc:
+    except (ConfigError, StateError) as exc:
         sys.stderr.write(f"train-guard: {exc}\n")
         return 2
 
