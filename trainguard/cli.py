@@ -18,6 +18,7 @@ import shlex
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 try:
@@ -30,6 +31,12 @@ if __package__:
     from .config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
     from .model import PowerSource, ProcessIdentity, utc_now
     from .policy import PolicyEngine
+    from .processes import (
+        ProcessController,
+        identity_is_alive,
+        is_guard_process,
+        process_identity,
+    )
     from .sensors import SensorReader
     from .state import (
         AppPaths,
@@ -44,6 +51,12 @@ else:  # Keep direct execution from a checkout working.
     from config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
     from model import PowerSource, ProcessIdentity, utc_now
     from policy import PolicyEngine
+    from processes import (
+        ProcessController,
+        identity_is_alive,
+        is_guard_process,
+        process_identity,
+    )
     from sensors import SensorReader
     from state import (
         AppPaths,
@@ -160,48 +173,14 @@ def _apply(decision, procs):
 
 
 # Process lookup.
-def _is_guard_proc(p):
-    try:
-        return any(tok in " ".join(p.cmdline()) for tok in ("trainguard", "train_guard"))
-    except Exception:
-        return False
-
-
 def _pattern_running(pat):
     for p in psutil.process_iter(["cmdline"]):
         try:
-            if pat in " ".join(p.info["cmdline"] or []) and not _is_guard_proc(p):
+            if pat in " ".join(p.info["cmdline"] or []) and not is_guard_process(p):
                 return True
         except Exception:
             continue
     return False
-
-
-def _targets(meta):
-    roots = []
-    if meta["mode"] == "run":
-        try:
-            roots = [psutil.Process(meta["jobpid"])]
-        except psutil.NoSuchProcess:
-            return []
-    else:
-        pat = meta["pattern"]
-        for p in psutil.process_iter(["pid", "cmdline"]):
-            try:
-                cl = " ".join(p.info["cmdline"] or [])
-            except Exception:
-                continue
-            if pat in cl and p.pid != os.getpid() and not _is_guard_proc(p):
-                roots.append(p)
-    out = {}
-    for r in roots:
-        try:
-            out[r.pid] = r
-            for c in r.children(recursive=True):
-                out[c.pid] = c
-        except psutil.NoSuchProcess:
-            continue
-    return list(out.values())
 
 
 # Filesystem helpers.
@@ -219,33 +198,34 @@ def _alive(pid):
 def _capture_identity(pid, label):
     try:
         process = psutil.Process(pid)
-        return ProcessIdentity(pid=process.pid, create_time=process.create_time())
+        return process_identity(process)
     except psutil.NoSuchProcess as exc:
         raise StateError(f"{label} process {pid} does not exist") from exc
     except psutil.AccessDenied as exc:
         raise StateError(f"cannot inspect {label} process {pid}") from exc
 
 
-def _guard_pid(store, name):
+def _guard_status(store, name):
     identity = store.read_guard(name)
     if identity is not None:
-        return identity.pid
-    return _read_pid(store.legacy_guard_path(name))
+        return identity.pid, identity_is_alive(identity)
+    pid = _read_pid(store.legacy_guard_path(name))
+    return pid, _alive(pid)
 
 
 def _ensure_name_available(store, name):
     validate_job_name(name)
     if store.spec_path(name).exists():
-        guard_pid = _guard_pid(store, name)
-        if _alive(guard_pid):
+        _guard_pid, guard_alive = _guard_status(store, name)
+        if guard_alive:
             raise StateError(f"a guard named '{name}' is already active")
         raise StateError(
             f"guard '{name}' has stale state; inspect it with `train-guard status` "
             "before reusing this name"
         )
 
-    guard_pid = _guard_pid(store, name)
-    if _alive(guard_pid):
+    _guard_pid, guard_alive = _guard_status(store, name)
+    if guard_alive:
         raise StateError(
             f"guard '{name}' has a live supervisor but no job metadata; "
             "stop that process or choose another name"
@@ -264,6 +244,50 @@ def _glog(name, msg):
         f.write(f"[guard] {_now()} {msg}\n")
 
 
+def _migrate_legacy_identity(store, spec):
+    """Upgrade safe PID-only metadata without adopting a reused PID."""
+
+    if spec.mode != "run" or spec.root is not None or spec.legacy_pid is None:
+        return spec
+    try:
+        identity = process_identity(psutil.Process(spec.legacy_pid))
+    except (psutil.NoSuchProcess, psutil.ZombieProcess) as exc:
+        raise StateError(
+            f"legacy job process {spec.legacy_pid} no longer exists; "
+            "its metadata was preserved"
+        ) from exc
+    except psutil.AccessDenied as exc:
+        raise StateError(
+            f"cannot verify legacy job process {spec.legacy_pid}; "
+            "its metadata was preserved"
+        ) from exc
+
+    try:
+        recorded_at = store.spec_path(spec.name).stat().st_mtime
+    except OSError as exc:
+        raise StateError(
+            f"cannot date legacy metadata for guard '{spec.name}'"
+        ) from exc
+    if identity.create_time > recorded_at:
+        message = (
+            f"STATE_MIGRATION_REFUSED pid={identity.pid}: current process "
+            "started after the legacy metadata was written"
+        )
+        _glog(spec.name, message)
+        raise StateError(
+            f"legacy PID {identity.pid} now belongs to a newer process; "
+            "the metadata was preserved"
+        )
+
+    migrated = replace(spec, root=identity, legacy_pid=None)
+    store.write_spec(migrated)
+    _glog(
+        spec.name,
+        f"STATE_MIGRATED pid={identity.pid} create_time={identity.create_time:g}",
+    )
+    return migrated
+
+
 def _spawn_detached(args, logfile=None, cwd=None):
     out = open(logfile, "ab") if logfile else subprocess.DEVNULL
     kw = dict(stdin=subprocess.DEVNULL, stdout=out, stderr=out, cwd=cwd)
@@ -278,8 +302,16 @@ def _spawn_detached(args, logfile=None, cwd=None):
             out.close()
 
 
-def _supervisor_argv(name):
-    return [sys.executable, str(Path(__file__).resolve()), "__supervise", name]
+def _supervisor_argv(name, excluded_identity=None):
+    argv = [sys.executable, str(Path(__file__).resolve()), "__supervise", name]
+    if excluded_identity is not None:
+        argv.extend(
+            [
+                str(excluded_identity.pid),
+                repr(float(excluded_identity.create_time)),
+            ]
+        )
+    return argv
 
 
 def _runtime_payload(state, cooling, pids, observation=None, decision=None, config_error=None):
@@ -315,27 +347,35 @@ def _runtime_payload(state, cooling, pids, observation=None, decision=None, conf
 
 
 # Supervisor loop.
-def cmd_supervise(name):
+def cmd_supervise(name, excluded_identity=None):
     paths = _paths()
     store = JobStore(paths)
-    spec = store.read_spec(name)
-    meta = spec.to_dict()
+    spec = _migrate_legacy_identity(store, store.read_spec(name))
+    if spec.mode == "attach" and excluded_identity is None:
+        raise StateError(
+            "cannot identify the CLI that launched this match supervisor"
+        )
+    controller = ProcessController(
+        excluded_identities=(
+            () if excluded_identity is None else (excluded_identity,)
+        )
+    )
     detail = (
-        f"pattern={meta.get('pattern')}"
-        if meta["mode"] == "attach"
-        else f"jobpid={meta.get('jobpid')}"
+        f"pattern={spec.pattern}"
+        if spec.mode == "attach"
+        else f"jobpid={spec.root_pid}"
     )
     cfg = load_policy(paths.config)
     watcher = ConfigWatcher(paths.config, cfg)
     engine = PolicyEngine()  # cooldown state belongs to this supervisor alone
     reader = SensorReader()
-    _glog(name, f"START mode={meta['mode']} {detail}")
+    _glog(name, f"START mode={spec.mode} {detail}")
     last, warned, miss = None, (), 0
     store.write_runtime(name, _runtime_payload("starting", False, []))
     while True:
         how = store.read_stop(name)
         if how is not None:
-            procs = _targets(meta)
+            procs = controller.resolve(spec).processes
             _apply("full", procs)
             if how == "kill":
                 for p in procs:
@@ -348,7 +388,8 @@ def cmd_supervise(name):
                 _glog(name, "STOP: unfroze job, detaching")
             store.remove_active_state(name)
             return
-        if meta["mode"] == "run" and not psutil.pid_exists(meta["jobpid"]):
+        snapshot = controller.resolve(spec)
+        if spec.mode == "run" and not snapshot.root_alive:
             _glog(name, "job exited; guard done")
             store.remove_active_state(name)
             return
@@ -358,8 +399,8 @@ def cmd_supervise(name):
                 _glog(name, f"CONFIG rejected: {config_error}; keeping last valid policy")
             else:
                 _glog(name, "CONFIG loaded")
-        procs = _targets(meta)
-        if meta["mode"] == "attach" and not procs:
+        procs = snapshot.processes
+        if spec.mode == "attach" and not procs:
             miss += 1
             if miss % 15 == 1:
                 _glog(name, "no process matches pattern yet (waiting)")
@@ -468,8 +509,10 @@ def cmd_attach(args):
     cwd = args.cwd or os.getcwd()
     if args.pid:
         spec = JobSpec.attached_pid(name, _capture_identity(int(args.pid), "attached"))
+        excluded_identity = None
     else:
         spec = JobSpec.attached_pattern(name, args.match)
+        excluded_identity = _capture_identity(os.getpid(), "launcher")
     with store.lock_name(name):
         _ensure_name_available(store, name)
         store.write_spec(spec)
@@ -483,7 +526,7 @@ def cmd_attach(args):
                     start=args.start,
                 )
             )
-        sup = _spawn_detached(_supervisor_argv(name))
+        sup = _spawn_detached(_supervisor_argv(name, excluded_identity))
         guard = _capture_identity(sup.pid, "supervisor")
         store.write_guard(name, guard)
     tag = "  (restart/reattach configured for next login)" if restart else ""
@@ -553,13 +596,12 @@ def cmd_status(args):
     if not specs:
         print("  (none)")
     for spec in specs:
-        meta = spec.to_dict()
         try:
-            gp = _guard_pid(store, spec.name)
+            gp, guard_alive = _guard_status(store, spec.name)
         except StateError:
-            gp = None
-        alive = "running" if _alive(gp) else "dead"
-        procs = _targets(meta)
+            gp, guard_alive = None, False
+        alive = "running" if guard_alive else "dead"
+        procs = ProcessController().resolve(spec).processes
         if procs:
             st = "PAUSED/frozen" if any(p.status() == psutil.STATUS_STOPPED for p in procs) else "running"
             worker = f"{st}  ({len(procs)} proc)"
@@ -631,7 +673,7 @@ def cmd_restart_persisted(args):
     persisted = list(store.list_persistence())
     for _path, spec in persisted:
         name = spec.name
-        if store.spec_path(name).exists() and _alive(_guard_pid(store, name)):
+        if store.spec_path(name).exists() and _guard_status(store, name)[1]:
             print(f"[restart] '{name}' already active; skipping")
             continue
         if spec.mode == "run":
@@ -786,7 +828,20 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
         if argv and argv[0] == "__supervise":   # internal
-            return cmd_supervise(argv[1])
+            if len(argv) not in {2, 4}:
+                raise StateError("invalid internal supervisor arguments")
+            excluded_identity = None
+            if len(argv) == 4:
+                try:
+                    excluded_identity = ProcessIdentity(
+                        pid=int(argv[2]),
+                        create_time=float(argv[3]),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise StateError(
+                        "invalid launching CLI identity"
+                    ) from exc
+            return cmd_supervise(argv[1], excluded_identity)
         parser = build_parser()
         args = parser.parse_args(argv)
         if not getattr(args, "fn", None):

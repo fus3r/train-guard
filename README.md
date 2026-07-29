@@ -195,6 +195,13 @@ and atomically replace the prior value; non-finite JSON numbers are rejected.
 An advisory `<name>.lock` also prevents two commands from creating the same job
 at once. The lock file remains in place for reuse.
 
+Process identity is the pair of PID and creation time, not the PID alone. Every
+tree lookup checks both values before controlling a recorded process. Legacy
+PID-only metadata is upgraded only when the current process predates that
+metadata; otherwise the state is preserved and the migration is refused.
+Match-based attachment also excludes the exact CLI process that launched its
+supervisor, even when the pattern appears in that CLI's own command line.
+
 Malformed state is reported by `status` rather than guessed or deleted. A
 runtime record left without its metadata is likewise preserved and blocks a
 new job from silently adopting the same name.
