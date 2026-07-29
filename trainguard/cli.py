@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
 
 if __package__:
     from .config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
-    from .model import PowerSource, ProcessIdentity, utc_now
+    from .model import Action, PowerSource, ProcessIdentity, utc_now
     from .policy import PolicyEngine
     from .processes import (
         ProcessController,
@@ -49,7 +49,7 @@ if __package__:
     )
 else:  # Keep direct execution from a checkout working.
     from config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
-    from model import PowerSource, ProcessIdentity, utc_now
+    from model import Action, PowerSource, ProcessIdentity, utc_now
     from policy import PolicyEngine
     from processes import (
         ProcessController,
@@ -79,10 +79,6 @@ RUNDIR, LOGDIR, PERSIST = (
     _INITIAL_PATHS.persist,
 )
 CONFIGF = _INITIAL_PATHS.config
-
-# Linux niceness cannot normally be raised back to its original value by an
-# unprivileged process. Keep a reversible CPU-affinity snapshot instead.
-_LINUX_AFFINITY = {}
 
 
 def _sync_path_aliases(paths: AppPaths) -> None:
@@ -124,52 +120,6 @@ _SOURCE_LABELS = {
     PowerSource.BATTERY: "Battery",
     PowerSource.NO_BATTERY: "no battery exposed (treated as AC)",
 }
-
-
-# Process control.
-def _set_band(proc, band):
-    """Apply a best-effort scheduling band, never a CPU-core guarantee.
-
-    On macOS, ``taskpolicy -b`` marks a process as background work and leaves
-    placement to the kernel scheduler. Linux and Windows use their respective
-    low-priority controls. None of these mechanisms pins a job to a particular
-    physical core class.
-    """
-    try:
-        if SYSTEM == "Darwin":
-            flag = "-b" if band == "gentle" else "-B"
-            subprocess.run(["taskpolicy", flag, "-p", str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        elif SYSTEM == "Linux":
-            if band == "gentle":
-                allowed = proc.cpu_affinity()
-                _LINUX_AFFINITY.setdefault(proc.pid, allowed)
-                if len(allowed) > 1:
-                    proc.cpu_affinity(allowed[::2])
-            else:
-                original = _LINUX_AFFINITY.pop(proc.pid, None)
-                if original:
-                    proc.cpu_affinity(original)
-            try:
-                proc.ionice(psutil.IOPRIO_CLASS_IDLE if band == "gentle" else psutil.IOPRIO_CLASS_NONE)
-            except Exception:
-                pass
-        elif SYSTEM == "Windows":
-            proc.nice(psutil.IDLE_PRIORITY_CLASS if band == "gentle" else psutil.NORMAL_PRIORITY_CLASS)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        pass
-
-
-def _apply(decision, procs):
-    for p in procs:
-        try:
-            if decision == "stop":
-                p.suspend()
-            else:
-                p.resume()
-                _set_band(p, decision)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
 
 
 # Process lookup.
@@ -314,16 +264,24 @@ def _supervisor_argv(name, excluded_identity=None):
     return argv
 
 
-def _runtime_payload(state, cooling, pids, observation=None, decision=None, config_error=None):
+def _runtime_payload(
+    state,
+    cooling,
+    pids,
+    controller,
+    observation=None,
+    decision=None,
+    config_error=None,
+):
     payload = {
         "schema_version": 1,
         "updated_at": utc_now(),
         "state": state,
         "cooling": cooling,
-        # Empty, explicit ownership fields keep the recovery schema unambiguous
-        # without claiming ownership the current controller cannot yet prove.
-        "owned_suspensions": [],
-        "tuned_processes": [],
+        "owned_suspensions": [
+            identity.to_dict() for identity in controller.owned_suspensions
+        ],
+        "tuned_processes": list(controller.tuned_processes),
         "pids": sorted({int(pid) for pid in pids}),
     }
     if observation is not None:
@@ -356,10 +314,18 @@ def cmd_supervise(name, excluded_identity=None):
             "cannot identify the CLI that launched this match supervisor"
         )
     controller = ProcessController(
+        SYSTEM,
         excluded_identities=(
             () if excluded_identity is None else (excluded_identity,)
         )
     )
+    runtime = store.read_runtime(name)
+    if runtime is not None:
+        controller.adopt_owned(
+            ProcessIdentity.from_dict(value)
+            for value in runtime["owned_suspensions"]
+        )
+        controller.adopt_tuned(runtime["tuned_processes"])
     detail = (
         f"pattern={spec.pattern}"
         if spec.mode == "attach"
@@ -371,12 +337,15 @@ def cmd_supervise(name, excluded_identity=None):
     reader = SensorReader()
     _glog(name, f"START mode={spec.mode} {detail}")
     last, warned, miss = None, (), 0
-    store.write_runtime(name, _runtime_payload("starting", False, []))
+    store.write_runtime(
+        name,
+        _runtime_payload("starting", False, [], controller),
+    )
     while True:
         how = store.read_stop(name)
         if how is not None:
             procs = controller.resolve(spec).processes
-            _apply("full", procs)
+            report = controller.release_owned()
             if how == "kill":
                 for p in procs:
                     try:
@@ -385,11 +354,42 @@ def cmd_supervise(name, excluded_identity=None):
                         pass
                 _glog(name, "STOP --kill: terminated job")
             else:
-                _glog(name, "STOP: unfroze job, detaching")
+                _glog(name, "STOP: released owned process changes, detaching")
+            if report.access_denied:
+                store.write_runtime(
+                    name,
+                    _runtime_payload(
+                        "stop",
+                        engine.cooling,
+                        [proc.pid for proc in procs],
+                        controller,
+                    ),
+                )
+                _glog(
+                    name,
+                    "STOP incomplete: owned process state preserved for recovery",
+                )
+                return 1
             store.remove_active_state(name)
             return
         snapshot = controller.resolve(spec)
         if spec.mode == "run" and not snapshot.root_alive:
+            report = controller.release_owned()
+            if report.access_denied:
+                store.write_runtime(
+                    name,
+                    _runtime_payload(
+                        "job_exited",
+                        engine.cooling,
+                        [],
+                        controller,
+                    ),
+                )
+                _glog(
+                    name,
+                    "job exited; owned process state preserved for recovery",
+                )
+                return 1
             _glog(name, "job exited; guard done")
             store.remove_active_state(name)
             return
@@ -401,6 +401,7 @@ def cmd_supervise(name, excluded_identity=None):
                 _glog(name, "CONFIG loaded")
         procs = snapshot.processes
         if spec.mode == "attach" and not procs:
+            controller.apply(Action.FULL, ())
             miss += 1
             if miss % 15 == 1:
                 _glog(name, "no process matches pattern yet (waiting)")
@@ -410,6 +411,7 @@ def cmd_supervise(name, excluded_identity=None):
                     "waiting",
                     engine.cooling,
                     [],
+                    controller,
                     config_error=config_error,
                 ),
             )
@@ -423,13 +425,14 @@ def cmd_supervise(name, excluded_identity=None):
             warned = observation.warnings
         decision = engine.decide(cfg, observation)
         action, sig = decision.action.value, observation.signature()
-        _apply(action, procs)
+        controller.apply(decision.action, procs)
         store.write_runtime(
             name,
             _runtime_payload(
                 action,
                 decision.cooling,
                 [proc.pid for proc in procs],
+                controller,
                 observation=observation,
                 decision=decision,
                 config_error=config_error,
@@ -640,8 +643,12 @@ def cmd_stop(args):
         return 1
     store.request_stop(name, args.kill)
     store.remove_persistence(name)
-    print(f"[train-guard] stop requested for '{name}'" + (" (--kill the job)" if args.kill else "") +
-          "; unfreezes & detaches within one poll. (login restart removed)")
+    print(
+        f"[train-guard] stop requested for '{name}'"
+        + (" (--kill the job)" if args.kill else "")
+        + "; releases owned changes & detaches within one poll. "
+        "(login restart removed)"
+    )
     return 0
 
 
@@ -810,7 +817,10 @@ def build_parser():
         s = sub.add_parser(nm, help=hlp)
         s.set_defaults(fn=fn)
 
-    st = sub.add_parser("stop", help="stop supervising (unfreeze); --kill ends job")
+    st = sub.add_parser(
+        "stop",
+        help="stop supervising (release owned changes); --kill ends job",
+    )
     st.add_argument("name")
     st.add_argument("--kill", action="store_true")
     st.set_defaults(fn=cmd_stop)

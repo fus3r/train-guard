@@ -12,9 +12,7 @@ def isolated_home(monkeypatch, tmp_path):
     monkeypatch.setenv("TRAIN_GUARD_HOME", str(tg_home))
     monkeypatch.setattr(cli, "HOME", home)
     cli._sync_path_aliases(AppPaths.from_environment())
-    cli._LINUX_AFFINITY.clear()
     yield
-    cli._LINUX_AFFINITY.clear()
 
 
 @pytest.fixture

@@ -23,16 +23,26 @@ This repository is a public release snapshot. The package is MIT licensed.
 
 Pause and resume use host process APIs through `psutil`. On POSIX systems this
 is equivalent to `SIGSTOP` and `SIGCONT`. The process stays in memory, and
-multiprocessing children are included.
+multiprocessing children are included. `train-guard` records the PID and
+creation time only after it successfully suspends a process. A process that was
+already stopped remains externally owned and is never resumed by the guard. If
+another actor resumes a suspension that the guard does own while the policy
+still says `stop`, the guard reapplies that suspension on the next poll.
 
 Gentle mode is a best-effort scheduling request:
 
-- macOS applies `taskpolicy -b`. The kernel still chooses the cores, so this
-  does not pin a job to efficiency cores.
-- Linux narrows CPU affinity and requests idle I/O priority. Full mode restores
-  the original affinity.
-- Windows switches the process tree to `IDLE_PRIORITY_CLASS` and restores
-  normal priority in full mode.
+- macOS applies `taskpolicy -b` and later clears that hint with `taskpolicy
+  -B`. The kernel still chooses the cores, so this does not pin a job to
+  efficiency cores. `taskpolicy` cannot read and reconstruct an external
+  background hint that existed before `train-guard`.
+- Linux captures the current CPU affinity and I/O class before changing them,
+  then restores those captured values.
+- Windows captures the current priority class before switching to
+  `IDLE_PRIORITY_CLASS`, then restores that exact class.
+
+Owned suspensions and scheduling captures follow process identity across
+controller replacement. They are also released when a process leaves the
+target set, including when a match-based target becomes empty.
 
 Charging tools such as AlDente or `batt` manage charge limits. System tools such
 as TLP and auto-cpufreq manage broader machine policy. `train-guard` only
@@ -201,6 +211,10 @@ PID-only metadata is upgraded only when the current process predates that
 metadata; otherwise the state is preserved and the migration is refused.
 Match-based attachment also excludes the exact CLI process that launched its
 supervisor, even when the pattern appears in that CLI's own command line.
+Runtime state records only suspensions and reversible scheduling changes that
+the controller actually applied. A failed restoration keeps its identity and
+captured values available for a later retry rather than discarding recovery
+evidence.
 
 Malformed state is reported by `status` rather than guessed or deleted. A
 runtime record left without its metadata is likewise preserved and blocks a
