@@ -35,6 +35,11 @@ def fake_spawn(monkeypatch):
         "_capture_identity",
         lambda pid, _label: ProcessIdentity(pid, float(pid)),
     )
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_supervisor_ready",
+        lambda *_args, **_kwargs: None,
+    )
     return calls
 
 

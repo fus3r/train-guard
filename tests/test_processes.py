@@ -170,6 +170,11 @@ def test_match_attach_passes_the_launcher_identity_to_its_supervisor(
 
     monkeypatch.setattr(cli, "_capture_identity", capture)
     monkeypatch.setattr(cli, "_spawn_detached", spawn)
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_supervisor_ready",
+        lambda *_args, **_kwargs: None,
+    )
 
     assert (
         cli.main(

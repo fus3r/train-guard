@@ -494,6 +494,9 @@ class JobStore:
     def runtime_path(self, name: str) -> Path:
         return self._name_path(name, ".runtime.json")
 
+    def ready_path(self, name: str) -> Path:
+        return self._name_path(name, ".ready.json")
+
     def stop_path(self, name: str) -> Path:
         return self._name_path(name, ".stop")
 
@@ -546,6 +549,40 @@ class JobStore:
             return None
         return _validate_runtime_state(path, value)
 
+    def write_ready(self, name: str, identity: ProcessIdentity) -> None:
+        atomic_json_write(
+            self.ready_path(name),
+            {
+                "schema_version": 1,
+                "ready_at": utc_now(),
+                "supervisor": identity.to_dict(),
+            },
+        )
+
+    def read_ready(self, name: str) -> Optional[ProcessIdentity]:
+        path = self.ready_path(name)
+        try:
+            value = read_json(path)
+        except FileNotFoundError:
+            return None
+        if not isinstance(value, dict):
+            raise StateError(f"{path}: expected a JSON object")
+        if value.get("schema_version") != 1:
+            raise StateError(f"{path}: unsupported readiness schema")
+        supervisor = value.get("supervisor")
+        if not isinstance(supervisor, dict):
+            raise StateError(f"{path}: missing supervisor identity")
+        try:
+            return ProcessIdentity.from_dict(supervisor)
+        except ValueError as exc:
+            raise StateError(f"{path}: invalid supervisor identity: {exc}") from exc
+
+    def clear_ready(self, name: str) -> None:
+        try:
+            self.ready_path(name).unlink()
+        except FileNotFoundError:
+            pass
+
     def request_stop(self, name: str, kill: bool) -> None:
         _atomic_write(self.stop_path(name), "kill\n" if kill else "soft\n")
 
@@ -558,21 +595,34 @@ class JobStore:
             raise StateError(f"{self.stop_path(name)}: invalid stop request")
         return value
 
-    def remove_active_state(self, name: str) -> None:
-        for path in (
+    def clear_stop(self, name: str) -> None:
+        try:
+            self.stop_path(name).unlink()
+        except FileNotFoundError:
+            pass
+
+    def remove_active_state(self, name: str, *, keep_ready: bool = False) -> None:
+        paths = [
             self.stop_path(name),
             self.spec_path(name),
             self.guard_path(name),
             self.legacy_guard_path(name),
             self.runtime_path(name),
-        ):
+        ]
+        if not keep_ready:
+            paths.append(self.ready_path(name))
+        for path in paths:
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
 
     def remove_guard_state(self, name: str) -> None:
-        for path in (self.guard_path(name), self.legacy_guard_path(name)):
+        for path in (
+            self.guard_path(name),
+            self.legacy_guard_path(name),
+            self.ready_path(name),
+        ):
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -633,7 +683,12 @@ class JobStore:
                 if isinstance(exc, StateError):
                     errors.append(str(exc))
                 continue
-            for reader in (self.read_guard, self.read_runtime, self.read_stop):
+            for reader in (
+                self.read_guard,
+                self.read_runtime,
+                self.read_stop,
+                self.read_ready,
+            ):
                 try:
                     reader(spec.name)
                 except FileNotFoundError:

@@ -18,7 +18,6 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 
 try:
@@ -28,9 +27,8 @@ except ImportError:  # pragma: no cover
     raise
 
 if __package__:
-    from .config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
-    from .model import Action, PowerSource, ProcessIdentity, utc_now
-    from .policy import PolicyEngine
+    from .config import ConfigError, PolicyConfig, load_policy
+    from .model import PowerSource, ProcessIdentity
     from .processes import (
         ProcessController,
         identity_is_alive,
@@ -47,10 +45,14 @@ if __package__:
         atomic_json_write,
         validate_job_name,
     )
+    from .supervisor import (
+        _migrate_legacy_identity as _migrate_legacy_identity_impl,
+        _runtime_payload,
+        run_supervisor,
+    )
 else:  # Keep direct execution from a checkout working.
-    from config import ConfigError, ConfigWatcher, PolicyConfig, load_policy
-    from model import Action, PowerSource, ProcessIdentity, utc_now
-    from policy import PolicyEngine
+    from config import ConfigError, PolicyConfig, load_policy
+    from model import PowerSource, ProcessIdentity
     from processes import (
         ProcessController,
         identity_is_alive,
@@ -67,8 +69,14 @@ else:  # Keep direct execution from a checkout working.
         atomic_json_write,
         validate_job_name,
     )
+    from supervisor import (
+        _migrate_legacy_identity as _migrate_legacy_identity_impl,
+        _runtime_payload,
+        run_supervisor,
+    )
 
 __version__ = "0.2.0"
+_SUPERVISOR_START_TIMEOUT_SECONDS = 5.0
 SYSTEM = platform.system()  # 'Darwin' | 'Linux' | 'Windows'
 HOME = Path.home()
 _INITIAL_PATHS = AppPaths.from_environment()
@@ -110,8 +118,10 @@ def load_config() -> PolicyConfig:
     return load_policy(_paths().config)
 
 
-def _now():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+def _migrate_legacy_identity(store, spec):
+    """Compatibility wrapper for callers of the pre-Supervisor helper."""
+
+    return _migrate_legacy_identity_impl(store, spec)
 
 
 # How a power source is named in the status report.
@@ -183,59 +193,10 @@ def _ensure_name_available(store, name):
     if store.runtime_path(name).exists():
         raise StateError(
             f"guard '{name}' has recovery state but no job metadata; "
-            "inspect it with `train-guard status` before reusing this name"
+            f"run `train-guard recover {shlex.quote(name)}` before reusing this name"
         )
     store.remove_guard_state(name)
-
-
-def _glog(name, msg):
-    LOGDIR.mkdir(parents=True, exist_ok=True)
-    with open(LOGDIR / f"{name}.guard.log", "a") as f:
-        f.write(f"[guard] {_now()} {msg}\n")
-
-
-def _migrate_legacy_identity(store, spec):
-    """Upgrade safe PID-only metadata without adopting a reused PID."""
-
-    if spec.mode != "run" or spec.root is not None or spec.legacy_pid is None:
-        return spec
-    try:
-        identity = process_identity(psutil.Process(spec.legacy_pid))
-    except (psutil.NoSuchProcess, psutil.ZombieProcess) as exc:
-        raise StateError(
-            f"legacy job process {spec.legacy_pid} no longer exists; "
-            "its metadata was preserved"
-        ) from exc
-    except psutil.AccessDenied as exc:
-        raise StateError(
-            f"cannot verify legacy job process {spec.legacy_pid}; "
-            "its metadata was preserved"
-        ) from exc
-
-    try:
-        recorded_at = store.spec_path(spec.name).stat().st_mtime
-    except OSError as exc:
-        raise StateError(
-            f"cannot date legacy metadata for guard '{spec.name}'"
-        ) from exc
-    if identity.create_time > recorded_at:
-        message = (
-            f"STATE_MIGRATION_REFUSED pid={identity.pid}: current process "
-            "started after the legacy metadata was written"
-        )
-        _glog(spec.name, message)
-        raise StateError(
-            f"legacy PID {identity.pid} now belongs to a newer process; "
-            "the metadata was preserved"
-        )
-
-    migrated = replace(spec, root=identity, legacy_pid=None)
-    store.write_spec(migrated)
-    _glog(
-        spec.name,
-        f"STATE_MIGRATED pid={identity.pid} create_time={identity.create_time:g}",
-    )
-    return migrated
+    store.clear_stop(name)
 
 
 def _spawn_detached(args, logfile=None, cwd=None):
@@ -252,6 +213,26 @@ def _spawn_detached(args, logfile=None, cwd=None):
             out.close()
 
 
+def _terminate_spawned(process):
+    """Best-effort rollback for a child created by the current command."""
+
+    try:
+        process.terminate()
+    except OSError:
+        return
+    wait = getattr(process, "wait", None)
+    if wait is None:
+        return
+    try:
+        wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def _supervisor_argv(name, excluded_identity=None):
     argv = [sys.executable, str(Path(__file__).resolve()), "__supervise", name]
     if excluded_identity is not None:
@@ -264,185 +245,85 @@ def _supervisor_argv(name, excluded_identity=None):
     return argv
 
 
-def _runtime_payload(
-    state,
-    cooling,
-    pids,
-    controller,
-    observation=None,
-    decision=None,
-    config_error=None,
+def _supervisor_exited(supervisor, expected):
+    # A dead child remains a zombie until reaped, and its identity still
+    # matches. The Popen handle is therefore authoritative when available.
+    if supervisor is not None:
+        poll = getattr(supervisor, "poll", None)
+        if poll is not None:
+            return poll() is not None
+    return not identity_is_alive(expected)
+
+
+def _wait_for_supervisor_ready(
+    store,
+    name,
+    expected,
+    *,
+    supervisor=None,
+    timeout=_SUPERVISOR_START_TIMEOUT_SECONDS,
 ):
-    payload = {
-        "schema_version": 1,
-        "updated_at": utc_now(),
-        "state": state,
-        "cooling": cooling,
-        "owned_suspensions": [
-            identity.to_dict() for identity in controller.owned_suspensions
-        ],
-        "tuned_processes": list(controller.tuned_processes),
-        "pids": sorted({int(pid) for pid in pids}),
-    }
-    if observation is not None:
-        payload["observation"] = {
-            "source": observation.source.value,
-            "percent": observation.percent,
-            "temperature_c": observation.temperature_c,
-            "charging": observation.charging,
-            "observed_at": observation.observed_at,
-            "warnings": list(observation.warnings),
-        }
-    if decision is not None:
-        payload["decision"] = {
-            "action": decision.action.value,
-            "reason": decision.reason.value,
-            "cooling": decision.cooling,
-        }
-    if config_error:
-        payload["config_error"] = config_error
-    return payload
+    """Wait for the child-written handshake before reporting success."""
 
-
-# Supervisor loop.
-def cmd_supervise(name, excluded_identity=None):
-    paths = _paths()
-    store = JobStore(paths)
-    spec = _migrate_legacy_identity(store, store.read_spec(name))
-    if spec.mode == "attach" and excluded_identity is None:
-        raise StateError(
-            "cannot identify the CLI that launched this match supervisor"
-        )
-    controller = ProcessController(
-        SYSTEM,
-        excluded_identities=(
-            () if excluded_identity is None else (excluded_identity,)
-        )
-    )
-    runtime = store.read_runtime(name)
-    if runtime is not None:
-        controller.adopt_owned(
-            ProcessIdentity.from_dict(value)
-            for value in runtime["owned_suspensions"]
-        )
-        controller.adopt_tuned(runtime["tuned_processes"])
-    detail = (
-        f"pattern={spec.pattern}"
-        if spec.mode == "attach"
-        else f"jobpid={spec.root_pid}"
-    )
-    cfg = load_policy(paths.config)
-    watcher = ConfigWatcher(paths.config, cfg)
-    engine = PolicyEngine()  # cooldown state belongs to this supervisor alone
-    reader = SensorReader()
-    _glog(name, f"START mode={spec.mode} {detail}")
-    last, warned, miss = None, (), 0
-    store.write_runtime(
-        name,
-        _runtime_payload("starting", False, [], controller),
-    )
-    while True:
-        how = store.read_stop(name)
-        if how is not None:
-            procs = controller.resolve(spec).processes
-            report = controller.release_owned()
-            if how == "kill":
-                for p in procs:
-                    try:
-                        p.terminate()
-                    except Exception:
-                        pass
-                _glog(name, "STOP --kill: terminated job")
-            else:
-                _glog(name, "STOP: released owned process changes, detaching")
-            if report.access_denied:
-                store.write_runtime(
-                    name,
-                    _runtime_payload(
-                        "stop",
-                        engine.cooling,
-                        [proc.pid for proc in procs],
-                        controller,
-                    ),
+    deadline = time.monotonic() + timeout
+    exited = False
+    while time.monotonic() < deadline:
+        ready = store.read_ready(name)
+        if ready is not None:
+            if ready != expected:
+                raise StateError(
+                    f"supervisor identity changed while starting guard '{name}'"
                 )
-                _glog(
-                    name,
-                    "STOP incomplete: owned process state preserved for recovery",
-                )
-                return 1
-            store.remove_active_state(name)
+            # Reap a short-lived child if it has already exited.
+            if supervisor is not None and hasattr(supervisor, "poll"):
+                supervisor.poll()
+            store.clear_ready(name)
             return
-        snapshot = controller.resolve(spec)
-        if spec.mode == "run" and not snapshot.root_alive:
-            report = controller.release_owned()
-            if report.access_denied:
-                store.write_runtime(
-                    name,
-                    _runtime_payload(
-                        "job_exited",
-                        engine.cooling,
-                        [],
-                        controller,
-                    ),
-                )
-                _glog(
-                    name,
-                    "job exited; owned process state preserved for recovery",
-                )
-                return 1
-            _glog(name, "job exited; guard done")
-            store.remove_active_state(name)
-            return
-        cfg, config_changed, config_error = watcher.poll()
-        if config_changed:
-            if config_error:
-                _glog(name, f"CONFIG rejected: {config_error}; keeping last valid policy")
-            else:
-                _glog(name, "CONFIG loaded")
-        procs = snapshot.processes
-        if spec.mode == "attach" and not procs:
-            controller.apply(Action.FULL, ())
-            miss += 1
-            if miss % 15 == 1:
-                _glog(name, "no process matches pattern yet (waiting)")
-            store.write_runtime(
-                name,
-                _runtime_payload(
-                    "waiting",
-                    engine.cooling,
-                    [],
-                    controller,
-                    config_error=config_error,
-                ),
+        if exited:
+            log_path = store.paths.logs / f"{name}.guard.log"
+            raise StateError(
+                f"supervisor for guard '{name}' exited before it reported "
+                f"ready; inspect {log_path}"
             )
-            time.sleep(cfg.poll)
-            continue
-        miss = 0
-        observation = reader.sample()
-        if observation.warnings != warned:
-            for warning in observation.warnings:
-                _glog(name, f"SENSOR {warning}")
-            warned = observation.warnings
-        decision = engine.decide(cfg, observation)
-        action, sig = decision.action.value, observation.signature()
-        controller.apply(decision.action, procs)
-        store.write_runtime(
+        exited = _supervisor_exited(supervisor, expected)
+        if not exited:
+            time.sleep(0.02)
+    raise StateError(
+        f"supervisor for guard '{name}' did not report ready within "
+        f"{timeout:g} seconds"
+    )
+
+
+def _start_supervisor(store, name, excluded_identity=None):
+    store.clear_ready(name)
+    supervisor = _spawn_detached(
+        _supervisor_argv(name, excluded_identity),
+    )
+    try:
+        try:
+            identity = _capture_identity(supervisor.pid, "supervisor")
+        except StateError:
+            # On hosts without zombie processes, a guard for an immediate
+            # job can write readiness and disappear before psutil observes it.
+            ready = store.read_ready(name)
+            if ready is None or ready.pid != supervisor.pid:
+                raise
+            identity = ready
+        _wait_for_supervisor_ready(
+            store,
             name,
-            _runtime_payload(
-                action,
-                decision.cooling,
-                [proc.pid for proc in procs],
-                controller,
-                observation=observation,
-                decision=decision,
-                config_error=config_error,
-            ),
+            identity,
+            supervisor=supervisor,
         )
-        line = f"{action} {decision.reason.value} | {sig}"
-        if line != last:
-            _glog(name, f"-> {action}   ({decision.reason.value}; {sig})")
-            last = line
-        time.sleep(cfg.poll)
+        return identity
+    except Exception:
+        _terminate_spawned(supervisor)
+        store.remove_guard_state(name)
+        raise
+
+
+def cmd_supervise(name, excluded_identity=None):
+    return run_supervisor(_paths(), name, excluded_identity)
 
 
 # CLI commands.
@@ -460,6 +341,22 @@ def _restart_on_login(args):
     return bool(getattr(args, "restart_on_login", getattr(args, "persist", False)))
 
 
+def _previous_persistence(store, name, restart):
+    if not restart:
+        return None, False
+    path = store.persistence_path(name)
+    if not path.exists():
+        return None, False
+    return store.read_persistence(path), True
+
+
+def _rollback_persistence(store, name, previous, existed):
+    if existed:
+        store.write_persistence(previous)
+    else:
+        store.remove_persistence(name)
+
+
 def cmd_run(args):
     paths = _paths()
     store = JobStore(paths)
@@ -474,25 +371,45 @@ def cmd_run(args):
     cwd = args.cwd or os.getcwd()
     restart = _restart_on_login(args)
     log = paths.logs / f"{name}.log"
+    job = None
     with store.lock_name(name):
         _ensure_name_available(store, name)
-        if restart:
-            store.write_persistence(
-                PersistenceSpec(
-                    mode="run",
-                    name=name,
-                    cwd=cwd,
-                    argv=tuple(cmd),
+        previous, persistence_existed = _previous_persistence(
+            store,
+            name,
+            restart,
+        )
+        try:
+            job = _spawn_detached(cmd, logfile=log, cwd=cwd)
+            root = _capture_identity(job.pid, "job")
+            store.write_spec(JobSpec.launched(name, root, log))
+            if restart:
+                store.write_persistence(
+                    PersistenceSpec(
+                        mode="run",
+                        name=name,
+                        cwd=cwd,
+                        argv=tuple(cmd),
+                    )
                 )
-            )
-        job = _spawn_detached(cmd, logfile=log, cwd=cwd)
-        root = _capture_identity(job.pid, "job")
-        store.write_spec(JobSpec.launched(name, root, log))
-        sup = _spawn_detached(_supervisor_argv(name))
-        guard = _capture_identity(sup.pid, "supervisor")
-        store.write_guard(name, guard)
+            guard = _start_supervisor(store, name)
+        except Exception:
+            if job is not None:
+                _terminate_spawned(job)
+            store.remove_active_state(name)
+            if restart and not getattr(args, "_preserve_persistence", False):
+                _rollback_persistence(
+                    store,
+                    name,
+                    previous,
+                    persistence_existed,
+                )
+            raise
     tag = "  (restarts at next login)" if restart else ""
-    print(f"[train-guard] '{name}': job pid={job.pid}  guard pid={sup.pid}  out={log}{tag}")
+    print(
+        f"[train-guard] '{name}': job pid={job.pid}  "
+        f"guard pid={guard.pid}  out={log}{tag}"
+    )
     print(f"[train-guard] policy: {_policy_line(cfg)}   |   train-guard status")
     return 0
 
@@ -518,22 +435,40 @@ def cmd_attach(args):
         excluded_identity = _capture_identity(os.getpid(), "launcher")
     with store.lock_name(name):
         _ensure_name_available(store, name)
-        store.write_spec(spec)
-        if restart:
-            store.write_persistence(
-                PersistenceSpec(
-                    mode="attach",
-                    name=name,
-                    cwd=cwd,
-                    pattern=args.match,
-                    start=args.start,
+        previous, persistence_existed = _previous_persistence(
+            store,
+            name,
+            restart,
+        )
+        try:
+            store.write_spec(spec)
+            if restart:
+                store.write_persistence(
+                    PersistenceSpec(
+                        mode="attach",
+                        name=name,
+                        cwd=cwd,
+                        pattern=args.match,
+                        start=args.start,
+                    )
                 )
+            guard = _start_supervisor(
+                store,
+                name,
+                excluded_identity,
             )
-        sup = _spawn_detached(_supervisor_argv(name, excluded_identity))
-        guard = _capture_identity(sup.pid, "supervisor")
-        store.write_guard(name, guard)
+        except Exception:
+            store.remove_active_state(name)
+            if restart and not getattr(args, "_preserve_persistence", False):
+                _rollback_persistence(
+                    store,
+                    name,
+                    previous,
+                    persistence_existed,
+                )
+            raise
     tag = "  (restart/reattach configured for next login)" if restart else ""
-    print(f"[train-guard] attached '{name}'  guard pid={sup.pid}{tag}")
+    print(f"[train-guard] attached '{name}'  guard pid={guard.pid}{tag}")
     print(f"[train-guard] policy: {_policy_line(cfg)}   |   train-guard status")
     return 0
 
@@ -641,8 +576,15 @@ def cmd_stop(args):
     if not store.spec_path(name).exists():
         sys.stderr.write(f"no active guard named '{name}' (train-guard list)\n")
         return 1
-    store.request_stop(name, args.kill)
+    _guard_pid, guard_alive = _guard_status(store, name)
+    if not guard_alive:
+        raise StateError(
+            f"guard '{name}' is not running; use "
+            f"`train-guard recover {shlex.quote(name)}` to release recorded "
+            "process changes"
+        )
     store.remove_persistence(name)
+    store.request_stop(name, args.kill)
     print(
         f"[train-guard] stop requested for '{name}'"
         + (" (--kill the job)" if args.kill else "")
@@ -650,6 +592,84 @@ def cmd_stop(args):
         "(login restart removed)"
     )
     return 0
+
+
+def _runtime_identities(runtime):
+    if runtime is None:
+        return []
+    return [
+        ProcessIdentity.from_dict(value)
+        for value in runtime["owned_suspensions"]
+    ]
+
+
+def _runtime_tuning(runtime):
+    if runtime is None:
+        return []
+    return list(runtime["tuned_processes"])
+
+
+def _apply_report_dict(report):
+    return {
+        field: getattr(report, field)
+        for field in (
+            "targeted",
+            "suspended",
+            "resumed",
+            "access_denied",
+            "gone",
+            "tuned",
+            "restored",
+        )
+    }
+
+
+def cmd_recover(args):
+    paths = _paths()
+    store = JobStore(paths)
+    name = validate_job_name(args.name)
+    if (
+        not store.spec_path(name).exists()
+        and not store.runtime_path(name).exists()
+    ):
+        raise StateError(f"no stale guard named '{name}'")
+
+    _guard_pid, guard_alive = _guard_status(store, name)
+    if guard_alive:
+        raise StateError(
+            f"guard '{name}' is still running; use stop instead"
+        )
+
+    runtime = store.read_runtime(name)
+    controller = ProcessController()
+    controller.adopt_owned(_runtime_identities(runtime))
+    controller.adopt_tuned(_runtime_tuning(runtime))
+    report = controller.release_owned()
+    report_payload = _apply_report_dict(report)
+    if report.access_denied:
+        previous_pids = [] if runtime is None else runtime["pids"]
+        store.write_runtime(
+            name,
+            _runtime_payload(
+                "recovery_incomplete",
+                False if runtime is None else runtime["cooling"],
+                previous_pids,
+                controller,
+                process_report=report_payload,
+                error="permission denied while releasing owned process state",
+            ),
+        )
+        store.clear_stop(name)
+        store.remove_guard_state(name)
+    else:
+        store.remove_active_state(name)
+
+    print(
+        f"[train-guard] recovered '{name}': resumed {report.resumed}, "
+        f"restored {report.restored}, gone {report.gone}, "
+        f"denied {report.access_denied}"
+    )
+    return 1 if report.access_denied else 0
 
 
 def cmd_config(args):
@@ -678,24 +698,67 @@ def cmd_restart_persisted(args):
     store = JobStore(paths)
     load_policy(paths.config)
     persisted = list(store.list_persistence())
+    failures = 0
     for _path, spec in persisted:
-        name = spec.name
-        if store.spec_path(name).exists() and _guard_status(store, name)[1]:
-            print(f"[restart] '{name}' already active; skipping")
-            continue
-        if spec.mode == "run":
-            cmd_run(argparse.Namespace(name=name, restart_on_login=True,
-                                       cwd=spec.cwd, cmd=list(spec.argv)))
-        else:
-            pat, start = spec.pattern, spec.start or ""
-            if start and not _pattern_running(pat):
-                shell = ["cmd", "/c", start] if os.name == "nt" else ["/bin/sh", "-c", start]
-                _spawn_detached(shell, logfile=paths.logs / f"{name}.start.log", cwd=spec.cwd)
-                print(f"[restart] started job for '{name}': {start}")
-            cmd_attach(argparse.Namespace(name=name, restart_on_login=True, cwd=spec.cwd,
-                                          match=pat, pid=None, start=start))
+        try:
+            name = spec.name
+            if store.spec_path(name).exists():
+                if _guard_status(store, name)[1]:
+                    print(f"[restart] '{name}' already active; skipping")
+                else:
+                    print(
+                        f"[restart] '{name}' has stale state; "
+                        "run recover before restarting"
+                    )
+                    failures += 1
+                continue
+            if spec.mode == "run":
+                result = cmd_run(
+                    argparse.Namespace(
+                        name=name,
+                        restart_on_login=True,
+                        cwd=spec.cwd,
+                        cmd=list(spec.argv),
+                        _preserve_persistence=True,
+                    )
+                )
+            else:
+                pattern, start = spec.pattern, spec.start or ""
+                started_process = None
+                if start and not _pattern_running(pattern):
+                    shell = (
+                        ["cmd", "/c", start]
+                        if os.name == "nt"
+                        else ["/bin/sh", "-c", start]
+                    )
+                    started_process = _spawn_detached(
+                        shell,
+                        logfile=paths.logs / f"{name}.start.log",
+                        cwd=spec.cwd,
+                    )
+                    print(f"[restart] started job for '{name}': {start}")
+                result = 1
+                try:
+                    result = cmd_attach(
+                        argparse.Namespace(
+                            name=name,
+                            restart_on_login=True,
+                            cwd=spec.cwd,
+                            match=pattern,
+                            pid=None,
+                            start=start,
+                            _preserve_persistence=True,
+                        )
+                    )
+                finally:
+                    if result != 0 and started_process is not None:
+                        _terminate_spawned(started_process)
+            failures += int(result != 0)
+        except (ConfigError, OSError, StateError) as exc:
+            failures += 1
+            print(f"[restart] {spec.name}: {exc}", file=sys.stderr)
     print("[restart] done (commands were restarted or reattached; no RAM state was restored)")
-    return 0
+    return 1 if failures else 0
 
 
 # Compatibility for login agents installed by v0.1.
@@ -825,6 +888,13 @@ def build_parser():
     st.add_argument("--kill", action="store_true")
     st.set_defaults(fn=cmd_stop)
 
+    recover = sub.add_parser(
+        "recover",
+        help="release process changes recorded by a dead supervisor",
+    )
+    recover.add_argument("name")
+    recover.set_defaults(fn=cmd_recover)
+
     up = sub.add_parser("unpersist", help="forget a persisted job")
     up.add_argument("name")
     up.set_defaults(fn=cmd_unpersist)
@@ -857,7 +927,7 @@ def main(argv=None):
         if not getattr(args, "fn", None):
             return cmd_status(args)
         return args.fn(args)
-    except (ConfigError, StateError) as exc:
+    except (ConfigError, OSError, StateError) as exc:
         sys.stderr.write(f"train-guard: {exc}\n")
         return 2
 

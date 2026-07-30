@@ -88,6 +88,8 @@ train-guard list
 train-guard status
 train-guard stop bigtrain
 train-guard stop bigtrain --kill
+# After status reports a dead supervisor, release its recorded process changes.
+train-guard recover bigtrain
 train-guard config --init
 ```
 
@@ -118,7 +120,9 @@ login; it cannot restore RAM.
 
 ## Policy
 
-The supervisor rereads `~/.train-guard/config.json` while it runs.
+The supervisor rereads `~/.train-guard/config.json` while it runs. An invalid
+edit is reported in the guard log and runtime state, while the supervisor keeps
+using its last valid policy.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -218,7 +222,17 @@ evidence.
 
 Malformed state is reported by `status` rather than guessed or deleted. A
 runtime record left without its metadata is likewise preserved and blocks a
-new job from silently adopting the same name.
+new job from silently adopting the same name. `run` and `attach` report success
+only after the supervisor writes a readiness record containing its own
+PID-and-creation-time identity. A failed start terminates the children created
+by that attempt and rolls back only that attempt's state.
+
+`SIGINT`, `SIGTERM`, a soft `stop`, root-process exit and handled supervisor
+errors all release the suspensions and scheduling changes owned by the guard.
+If a dead supervisor could not release every change, `train-guard recover
+<name>` retries from the validated runtime identities. A permission-denied
+identity remains recorded as `*_incomplete`, so recovery can be retried without
+targeting a reused PID.
 
 ## Tests
 
