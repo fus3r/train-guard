@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
 
 if __package__:
     from .config import ConfigError, PolicyConfig, load_policy
+    from .journal import EventJournal
     from .model import PowerSource, ProcessIdentity
     from .processes import (
         ProcessController,
@@ -52,6 +53,7 @@ if __package__:
     )
 else:  # Keep direct execution from a checkout working.
     from config import ConfigError, PolicyConfig, load_policy
+    from journal import EventJournal
     from model import PowerSource, ProcessIdentity
     from processes import (
         ProcessController,
@@ -112,6 +114,11 @@ def _paths() -> AppPaths:
 
 def _ensure_dirs() -> None:
     _paths()
+
+
+def _json_dump(value) -> None:
+    json.dump(value, sys.stdout, indent=2, sort_keys=True, allow_nan=False)
+    sys.stdout.write("\n")
 
 
 def load_config() -> PolicyConfig:
@@ -494,8 +501,73 @@ def _agent_installed():
     return False
 
 
+def _guard_payloads(store):
+    guards = []
+    state_errors = store.audit_state()
+    for spec in store.list_specs():
+        guard_error = None
+        try:
+            guard_pid, guard_alive = _guard_status(store, spec.name)
+        except StateError as exc:
+            guard_pid, guard_alive = None, False
+            guard_error = str(exc)
+            if guard_error not in state_errors:
+                state_errors.append(guard_error)
+
+        runtime_error = None
+        try:
+            runtime = store.read_runtime(spec.name)
+        except StateError as exc:
+            runtime = None
+            runtime_error = str(exc)
+            if runtime_error not in state_errors:
+                state_errors.append(runtime_error)
+
+        guard = {
+            "alive": guard_alive,
+            "pid": guard_pid,
+            "identity_verified": (
+                guard_error is None and store.guard_path(spec.name).exists()
+            ),
+        }
+        if guard_error:
+            guard["error"] = guard_error
+        item = {
+            "name": spec.name,
+            "mode": spec.mode,
+            "guard": guard,
+            "runtime": runtime,
+        }
+        if runtime_error:
+            item["runtime_error"] = runtime_error
+        guards.append(item)
+    return guards, state_errors
+
+
+def _status_payload(paths):
+    store = JobStore(paths)
+    config = load_policy(paths.config)
+    observation = SensorReader().sample()
+    guards, state_errors = _guard_payloads(store)
+    return {
+        "schema_version": 1,
+        "version": __version__,
+        "observation": observation.to_dict(),
+        "policy": config.to_dict(),
+        "policy_error": None,
+        "guards": guards,
+        "login_agent_installed": _agent_installed(),
+        "restart_specs": [path.stem for path in sorted(paths.persist.glob("*.job"))],
+        "persistence_errors": [],
+        "state_errors": state_errors,
+    }
+
+
 def cmd_status(args):
     paths = _paths()
+    if getattr(args, "json", False):
+        _json_dump(_status_payload(paths))
+        return 0
     store = JobStore(paths)
     cfg = load_policy(paths.config)
     obs = SensorReader().sample()
@@ -565,6 +637,20 @@ def cmd_status(args):
 
 def cmd_list(args):
     store = JobStore(_paths())
+    if getattr(args, "json", False):
+        guards, _state_errors = _guard_payloads(store)
+        _json_dump(
+            [
+                {
+                    "name": item["name"],
+                    "mode": item["mode"],
+                    "alive": item["guard"]["alive"],
+                    "state": (item["runtime"] or {}).get("state", "starting"),
+                }
+                for item in guards
+            ]
+        )
+        return 0
     specs = store.list_specs()
     print("\n".join(spec.name for spec in specs) if specs else "(no active guards)")
     return 0
@@ -646,6 +732,15 @@ def cmd_recover(args):
     controller.adopt_tuned(_runtime_tuning(runtime))
     report = controller.release_owned()
     report_payload = _apply_report_dict(report)
+    EventJournal(paths, name).emit(
+        "recovery_incomplete" if report.access_denied else "recovered",
+        (
+            "could not release every process change recorded by a dead supervisor"
+            if report.access_denied
+            else "released process changes recorded by a dead supervisor"
+        ),
+        process_report=report_payload,
+    )
     if report.access_denied:
         previous_pids = [] if runtime is None else runtime["pids"]
         store.write_runtime(
@@ -670,6 +765,22 @@ def cmd_recover(args):
         f"denied {report.access_denied}"
     )
     return 1 if report.access_denied else 0
+
+
+def cmd_events(args):
+    events = EventJournal(_paths(), args.name).read(args.limit)
+    if args.json:
+        _json_dump(events)
+        return 0
+    if not events:
+        print("(no events)")
+        return 0
+    for event in events:
+        print(
+            f"{event.get('timestamp', '?')}  "
+            f"{event.get('event', '?'):<24}  {event.get('message', '')}"
+        )
+    return 0
 
 
 def cmd_config(args):
@@ -869,9 +980,15 @@ def build_parser():
     a.add_argument("--start")
     a.set_defaults(fn=cmd_attach)
 
-    for nm, fn, hlp in [("status", cmd_status, "power/battery/temp/guards"),
-                        ("list", cmd_list, "list active guards"),
-                        ("restart-persisted", cmd_restart_persisted,
+    status = sub.add_parser("status", help="power/battery/temp/guards")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(fn=cmd_status)
+
+    listing = sub.add_parser("list", help="list active guards")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(fn=cmd_list)
+
+    for nm, fn, hlp in [("restart-persisted", cmd_restart_persisted,
                          "restart or reattach configured jobs after login"),
                         ("resume", cmd_resume,
                          "compatibility alias for restart-persisted (does not restore RAM)"),
@@ -894,6 +1011,12 @@ def build_parser():
     )
     recover.add_argument("name")
     recover.set_defaults(fn=cmd_recover)
+
+    events = sub.add_parser("events", help="show the structured job event log")
+    events.add_argument("name")
+    events.add_argument("--limit", type=int, default=50)
+    events.add_argument("--json", action="store_true")
+    events.set_defaults(fn=cmd_events)
 
     up = sub.add_parser("unpersist", help="forget a persisted job")
     up.add_argument("name")

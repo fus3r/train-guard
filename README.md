@@ -86,6 +86,9 @@ train-guard attach --pid 12345
 
 train-guard list
 train-guard status
+train-guard events bigtrain --limit 10
+train-guard list --json
+train-guard status --json
 train-guard stop bigtrain
 train-guard stop bigtrain --kill
 # After status reports a dead supervisor, release its recorded process changes.
@@ -162,7 +165,11 @@ rules and keeps the first match:
 6. `ac_band`, reported as `no_battery` on a host that exposes no battery.
 
 The match selects `full`, `gentle` or `stop` for the process tree and names the
-rule that produced it. The guard log records both whenever they change.
+rule that produced it. The short guard log and the structured JSON Lines event
+journal record a decision only when its action, reason or observation changes.
+When a managed supervisor exit follows a stable interval, the terminal event
+repeats the last observation with the exit time so that interval has an explicit
+end without logging every sensor poll.
 
 Thermal pause has hysteresis: with the defaults, a job paused at 42 degrees
 stays paused until the pack reaches 36.
@@ -208,6 +215,11 @@ schema-versioned JSON files under `run/`. Writes are flushed to a temporary file
 and atomically replace the prior value; non-finite JSON numbers are rejected.
 An advisory `<name>.lock` also prevents two commands from creating the same job
 at once. The lock file remains in place for reuse.
+
+Each job also has `logs/<name>.guard.log` for short human-readable messages and
+`logs/<name>.events.jsonl` for independent structured events. The supervisor is
+the single writer while it is alive. `train-guard events <name>` ignores a
+corrupt line and applies `--limit` to valid events rather than raw lines.
 
 Process identity is the pair of PID and creation time, not the PID alone. Every
 tree lookup checks both values before controlling a recorded process. Legacy

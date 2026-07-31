@@ -69,6 +69,16 @@ class Observation:
         charging = "n/a" if self.charging is None else ("yes" if self.charging else "no")
         return f"power={self.source.value} batt={percent} temp={temperature} charging={charging}"
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source.value,
+            "percent": self.percent,
+            "temperature_c": self.temperature_c,
+            "charging": self.charging,
+            "observed_at": self.observed_at,
+            "warnings": list(self.warnings),
+        }
+
 
 @dataclass(frozen=True)
 class PolicyDecision:
@@ -77,6 +87,13 @@ class PolicyDecision:
     action: Action
     reason: DecisionReason
     cooling: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action.value,
+            "reason": self.reason.value,
+            "cooling": self.cooling,
+        }
 
 
 @dataclass(frozen=True, order=True)
