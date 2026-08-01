@@ -1,0 +1,4 @@
+{
+  "run_on_battery": [true, false],
+  "temp_pause_c": [40, 44]
+}

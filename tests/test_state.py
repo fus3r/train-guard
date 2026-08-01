@@ -201,7 +201,7 @@ def test_orphan_runtime_is_reported_and_blocks_spawn(app_paths, monkeypatch, cap
     )
     monkeypatch.setattr(cli, "_agent_installed", lambda: False)
 
-    assert cli.main(["status"]) == 0
+    assert cli.main(["status"]) == 1
     assert "recovery state has no job metadata" in capsys.readouterr().out
 
     spawned = []

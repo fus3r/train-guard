@@ -6,6 +6,7 @@ should not run. It resumes the same process tree, so the job is not restarted.
 Process control uses psutil; battery readings come from the host OS when they
 are available.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -17,6 +18,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -29,7 +31,7 @@ except ImportError:  # pragma: no cover
 if __package__:
     from .config import ConfigError, PolicyConfig, load_policy
     from .journal import EventJournal
-    from .model import PowerSource, ProcessIdentity
+    from .model import Action, PowerSource, ProcessIdentity
     from .processes import (
         ProcessController,
         identity_is_alive,
@@ -37,6 +39,7 @@ if __package__:
         process_identity,
     )
     from .sensors import SensorReader
+    from .simulation import TraceError, compare_policies, load_trace, simulate_policy
     from .state import (
         AppPaths,
         JobSpec,
@@ -51,10 +54,17 @@ if __package__:
         _runtime_payload,
         run_supervisor,
     )
+    from .sweep import (
+        DEFAULT_HOT_REFERENCE_C,
+        DEFAULT_LOW_BATTERY_REFERENCE_PCT,
+        SweepError,
+        parse_grid,
+        run_sweep,
+    )
 else:  # Keep direct execution from a checkout working.
     from config import ConfigError, PolicyConfig, load_policy
     from journal import EventJournal
-    from model import PowerSource, ProcessIdentity
+    from model import Action, PowerSource, ProcessIdentity
     from processes import (
         ProcessController,
         identity_is_alive,
@@ -62,6 +72,7 @@ else:  # Keep direct execution from a checkout working.
         process_identity,
     )
     from sensors import SensorReader
+    from simulation import TraceError, compare_policies, load_trace, simulate_policy
     from state import (
         AppPaths,
         JobSpec,
@@ -75,6 +86,13 @@ else:  # Keep direct execution from a checkout working.
         _migrate_legacy_identity as _migrate_legacy_identity_impl,
         _runtime_payload,
         run_supervisor,
+    )
+    from sweep import (
+        DEFAULT_HOT_REFERENCE_C,
+        DEFAULT_LOW_BATTERY_REFERENCE_PCT,
+        SweepError,
+        parse_grid,
+        run_sweep,
     )
 
 __version__ = "0.2.0"
@@ -210,7 +228,9 @@ def _spawn_detached(args, logfile=None, cwd=None):
     out = open(logfile, "ab") if logfile else subprocess.DEVNULL
     kw = dict(stdin=subprocess.DEVNULL, stdout=out, stderr=out, cwd=cwd)
     if os.name == "nt":
-        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        kw["creationflags"] = (
+            0x00000008 | 0x00000200
+        )  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         kw["start_new_session"] = True
     try:
@@ -296,8 +316,7 @@ def _wait_for_supervisor_ready(
         if not exited:
             time.sleep(0.02)
     raise StateError(
-        f"supervisor for guard '{name}' did not report ready within "
-        f"{timeout:g} seconds"
+        f"supervisor for guard '{name}' did not report ready within {timeout:g} seconds"
     )
 
 
@@ -348,6 +367,13 @@ def _restart_on_login(args):
     return bool(getattr(args, "restart_on_login", getattr(args, "persist", False)))
 
 
+def _working_directory(value):
+    path = Path(value or os.getcwd()).expanduser()
+    if not path.is_dir():
+        raise StateError(f"working directory does not exist: {path}")
+    return str(path.resolve())
+
+
 def _previous_persistence(store, name, restart):
     if not restart:
         return None, False
@@ -372,10 +398,12 @@ def cmd_run(args):
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
-        sys.stderr.write("usage: train-guard run [--name N] [--restart-on-login] [--cwd DIR] -- <command...>\n")
+        sys.stderr.write(
+            "usage: train-guard run [--name N] [--restart-on-login] [--cwd DIR] -- <command...>\n"
+        )
         return 2
     name = validate_job_name(args.name or f"job-{time.strftime('%H%M%S')}")
-    cwd = args.cwd or os.getcwd()
+    cwd = _working_directory(args.cwd)
     restart = _restart_on_login(args)
     log = paths.logs / f"{name}.log"
     job = None
@@ -426,14 +454,18 @@ def cmd_attach(args):
     store = JobStore(paths)
     cfg = load_policy(paths.config)
     if not args.match and not args.pid:
-        sys.stderr.write('usage: train-guard attach --match "<pattern>" [--name N] [--restart-on-login --start "<cmd>"]   (or --pid PID)\n')
+        sys.stderr.write(
+            'usage: train-guard attach --match "<pattern>" [--name N] [--restart-on-login --start "<cmd>"]   (or --pid PID)\n'
+        )
         return 2
     restart = _restart_on_login(args)
     if args.pid and restart:
-        sys.stderr.write("attach: a PID cannot survive a reboot; use --match with --restart-on-login and optionally --start\n")
+        sys.stderr.write(
+            "attach: a PID cannot survive a reboot; use --match with --restart-on-login and optionally --start\n"
+        )
         return 2
     name = validate_job_name(args.name or f"attach-{time.strftime('%H%M%S')}")
-    cwd = args.cwd or os.getcwd()
+    cwd = _working_directory(args.cwd)
     if args.pid:
         spec = JobSpec.attached_pid(name, _capture_identity(int(args.pid), "attached"))
         excluded_identity = None
@@ -488,12 +520,15 @@ def _agent_installed():
     if SYSTEM == "Windows":
         try:
             for task in ("TrainGuardRestart", "TrainGuardResume"):
-                if subprocess.run(
-                    ["schtasks", "/Query", "/TN", task],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                ).returncode == 0:
+                if (
+                    subprocess.run(
+                        ["schtasks", "/Query", "/TN", task],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                    ).returncode
+                    == 0
+                ):
                     return True
             return False
         except (OSError, subprocess.SubprocessError):
@@ -546,45 +581,63 @@ def _guard_payloads(store):
 
 def _status_payload(paths):
     store = JobStore(paths)
-    config = load_policy(paths.config)
+    config_error = None
+    try:
+        config = load_policy(paths.config)
+    except ConfigError as exc:
+        config = PolicyConfig()
+        config_error = str(exc)
     observation = SensorReader().sample()
     guards, state_errors = _guard_payloads(store)
+    restart_specs = []
+    persistence_errors = []
+    for path in sorted(paths.persist.glob("*.job")):
+        try:
+            restart_specs.append(store.read_persistence(path).name)
+        except StateError as exc:
+            persistence_errors.append(f"{path}: {exc}")
     return {
         "schema_version": 1,
         "version": __version__,
         "observation": observation.to_dict(),
         "policy": config.to_dict(),
-        "policy_error": None,
+        "policy_error": config_error,
         "guards": guards,
         "login_agent_installed": _agent_installed(),
-        "restart_specs": [path.stem for path in sorted(paths.persist.glob("*.job"))],
-        "persistence_errors": [],
+        "restart_specs": restart_specs,
+        "persistence_errors": persistence_errors,
         "state_errors": state_errors,
     }
 
 
 def cmd_status(args):
     paths = _paths()
+    payload = _status_payload(paths)
     if getattr(args, "json", False):
-        _json_dump(_status_payload(paths))
-        return 0
-    store = JobStore(paths)
-    cfg = load_policy(paths.config)
-    obs = SensorReader().sample()
+        _json_dump(payload)
+        return 1 if payload["policy_error"] or payload["state_errors"] else 0
+
+    cfg = PolicyConfig(**payload["policy"])
+    obs = payload["observation"]
     print("power / battery")
-    temp = obs.temperature_c
+    temp = obs["temperature_c"]
     tshow = "n/a (not exposed on this OS)" if temp is None else f"{temp:.1f}°C"
-    pct = "n/a" if obs.percent is None else f"{obs.percent:g}%"
-    chg = "n/a" if obs.charging is None else ("yes" if obs.charging else "no")
+    pct = "n/a" if obs["percent"] is None else f"{obs['percent']:g}%"
+    chg = "n/a" if obs["charging"] is None else ("yes" if obs["charging"] else "no")
     print(
-        f"  source: {_SOURCE_LABELS[obs.source]}   charge: {pct}   "
+        f"  source: {_SOURCE_LABELS[PowerSource(obs['source'])]}   charge: {pct}   "
         f"charging: {chg}   pack temp: {tshow}"
     )
-    for warning in obs.warnings:
+    for warning in obs["warnings"]:
         print(f"  note: {warning}")
     if SYSTEM == "Darwin":
         try:
-            sp = subprocess.run(["system_profiler", "SPPowerDataType"], capture_output=True, text=True, timeout=10).stdout
+            sp = subprocess.run(
+                ["system_profiler", "SPPowerDataType"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
             for line in sp.splitlines():
                 if re.search(r"Cycle Count|Condition|Maximum Capacity", line):
                     print("  " + line.strip())
@@ -592,6 +645,9 @@ def cmd_status(args):
             pass
     print()
     print("policy (config.json)")
+    if payload["policy_error"]:
+        print(f"  INVALID: {payload['policy_error']}")
+        print("  defaults shown; active guards keep their last valid policy")
     print(f"  {_policy_line(cfg)}")
     print(
         f"  thermal: gentle >= {cfg.temp_gentle_c:g}°C  "
@@ -602,43 +658,61 @@ def cmd_status(args):
     )
     print()
     print("active guards")
-    specs = store.list_specs()
-    if not specs:
+    if not payload["guards"]:
         print("  (none)")
-    for spec in specs:
-        try:
-            gp, guard_alive = _guard_status(store, spec.name)
-        except StateError:
-            gp, guard_alive = None, False
-        alive = "running" if guard_alive else "dead"
-        procs = ProcessController().resolve(spec).processes
-        if procs:
-            st = "PAUSED/frozen" if any(p.status() == psutil.STATUS_STOPPED for p in procs) else "running"
-            worker = f"{st}  ({len(procs)} proc)"
-        else:
-            worker = "none right now"
+    for item in payload["guards"]:
+        alive = "running" if item["guard"]["alive"] else "dead"
+        runtime = item["runtime"] or {}
+        state = runtime.get("state", "starting")
+        pids = runtime.get("pids", [])
         print(
-            f"  {spec.name} [{spec.mode}]  guard={alive} (pid {gp})   "
-            f"worker: {worker}"
+            f"  {item['name']} [{item['mode']}]  guard={alive} "
+            f"(pid {item['guard']['pid']})  state={state}  pids={pids}"
         )
-    state_errors = store.audit_state()
-    if state_errors:
+        if item["guard"].get("error"):
+            print(f"    guard state invalid: {item['guard']['error']}")
+        if item.get("runtime_error"):
+            print(f"    runtime state invalid: {item['runtime_error']}")
+        if runtime.get("decision"):
+            decision = runtime["decision"]
+            print(f"    last decision: {decision['action']} ({decision['reason']})")
+        if runtime.get("config_error"):
+            print(f"    config rejected: {runtime['config_error']}")
+    if payload["state_errors"]:
         print()
         print("state issues")
-        for error in state_errors:
+        for error in payload["state_errors"]:
             print(f"  ! {error}")
     print()
-    print("restart after reboot (starts a new process; RAM state cannot survive a reboot)")
-    print(f"  login agent: {'INSTALLED' if _agent_installed() else 'not installed  ->  train-guard install-agent'}")
-    pj = sorted(paths.persist.glob("*.job"))
-    print("  restart specs: " + (", ".join(p.stem for p in pj) if pj else "none (add --restart-on-login to run/attach)"))
-    return 0
+    print(
+        "restart after reboot (starts a new process; RAM state cannot survive a reboot)"
+    )
+    print(
+        "  login agent: "
+        + (
+            "INSTALLED"
+            if payload["login_agent_installed"]
+            else "not installed  ->  train-guard install-agent"
+        )
+    )
+    restart_specs = payload["restart_specs"]
+    print(
+        "  restart specs: "
+        + (
+            ", ".join(restart_specs)
+            if restart_specs
+            else "none (add --restart-on-login to run/attach)"
+        )
+    )
+    for error in payload["persistence_errors"]:
+        print(f"  invalid restart spec: {error}")
+    return 1 if payload["policy_error"] or payload["state_errors"] else 0
 
 
 def cmd_list(args):
     store = JobStore(_paths())
+    guards, state_errors = _guard_payloads(store)
     if getattr(args, "json", False):
-        guards, _state_errors = _guard_payloads(store)
         _json_dump(
             [
                 {
@@ -650,10 +724,15 @@ def cmd_list(args):
                 for item in guards
             ]
         )
-        return 0
-    specs = store.list_specs()
-    print("\n".join(spec.name for spec in specs) if specs else "(no active guards)")
-    return 0
+    else:
+        print(
+            "\n".join(item["name"] for item in guards)
+            if guards
+            else "(no active guards)"
+        )
+    for error in state_errors:
+        print(f"state error: {error}", file=sys.stderr)
+    return 1 if state_errors else 0
 
 
 def cmd_stop(args):
@@ -683,10 +762,7 @@ def cmd_stop(args):
 def _runtime_identities(runtime):
     if runtime is None:
         return []
-    return [
-        ProcessIdentity.from_dict(value)
-        for value in runtime["owned_suspensions"]
-    ]
+    return [ProcessIdentity.from_dict(value) for value in runtime["owned_suspensions"]]
 
 
 def _runtime_tuning(runtime):
@@ -714,17 +790,12 @@ def cmd_recover(args):
     paths = _paths()
     store = JobStore(paths)
     name = validate_job_name(args.name)
-    if (
-        not store.spec_path(name).exists()
-        and not store.runtime_path(name).exists()
-    ):
+    if not store.spec_path(name).exists() and not store.runtime_path(name).exists():
         raise StateError(f"no stale guard named '{name}'")
 
     _guard_pid, guard_alive = _guard_status(store, name)
     if guard_alive:
-        raise StateError(
-            f"guard '{name}' is still running; use stop instead"
-        )
+        raise StateError(f"guard '{name}' is still running; use stop instead")
 
     runtime = store.read_runtime(name)
     controller = ProcessController()
@@ -768,6 +839,8 @@ def cmd_recover(args):
 
 
 def cmd_events(args):
+    if args.limit < 1:
+        raise StateError("--limit must be at least 1")
     events = EventJournal(_paths(), args.name).read(args.limit)
     if args.json:
         _json_dump(events)
@@ -783,19 +856,334 @@ def cmd_events(args):
     return 0
 
 
+def cmd_simulate(args):
+    if args.transition_limit < 1:
+        raise StateError("--transition-limit must be at least 1")
+    trace_path = Path(args.trace).expanduser().resolve()
+    if args.config_path:
+        config_path = Path(args.config_path).expanduser().resolve()
+        if not config_path.is_file():
+            raise StateError(f"configuration file does not exist: {config_path}")
+    else:
+        # Deliberately do not call _paths(): replay must not create state.
+        config_path = AppPaths.from_environment().config
+
+    policy = load_policy(config_path)
+    observations = load_trace(trace_path)
+    if args.compare_config_path:
+        candidate_path = Path(args.compare_config_path).expanduser().resolve()
+        if not candidate_path.is_file():
+            raise StateError(
+                f"comparison configuration file does not exist: {candidate_path}"
+            )
+        candidate = load_policy(candidate_path)
+        comparison = compare_policies(policy, candidate, observations)
+        comparison["trace"] = str(trace_path)
+        comparison["baseline_config_source"] = (
+            str(config_path) if config_path.exists() else "defaults"
+        )
+        comparison["candidate_config_source"] = str(candidate_path)
+        if args.json:
+            _json_dump(comparison)
+            return 0
+
+        delta = comparison["delta"]
+        disagreement_percent = delta["action_disagreement_percent"]
+        disagreement_share = (
+            "n/a" if disagreement_percent is None else f"{disagreement_percent:.1f}%"
+        )
+        print(
+            f"trace: {trace_path}  samples={comparison['baseline']['samples']}  "
+            f"elapsed={comparison['baseline']['elapsed_seconds']:g}s"
+        )
+        print(f"baseline:  {_policy_line(policy)}")
+        print(f"candidate: {_policy_line(candidate)}")
+        print("candidate minus baseline")
+        for action in Action:
+            seconds = delta["action_seconds"][action.value]
+            percent = delta["action_percent"][action.value]
+            percentage_points = "n/a" if percent is None else f"{percent:+.1f} pp"
+            print(f"  {action.value:<7} {seconds:+8g}s  {percentage_points:>9}")
+        print(
+            f"action disagreement: {delta['action_disagreement_seconds']:g}s "
+            f"({disagreement_share}), {delta['action_disagreement_samples']} "
+            "samples"
+        )
+        print(
+            f"transition delta: {delta['action_transitions']:+d} action, "
+            f"{delta['decision_transitions']:+d} decision"
+        )
+        for record in comparison["disagreements"][: args.transition_limit]:
+            baseline_decision = record["baseline"]
+            candidate_decision = record["candidate"]
+            print(
+                f"  {record['observed_at']}  "
+                f"{baseline_decision['action']}/{baseline_decision['reason']} -> "
+                f"{candidate_decision['action']}/{candidate_decision['reason']}"
+            )
+        remaining = len(comparison["disagreements"]) - args.transition_limit
+        if remaining > 0:
+            print(f"  ... {remaining} more; use --json for the complete comparison")
+        return 0
+
+    report = simulate_policy(policy, observations)
+    report["trace"] = str(trace_path)
+    report["config_source"] = str(config_path) if config_path.exists() else "defaults"
+    if args.json:
+        _json_dump(report)
+        return 0
+
+    print(
+        f"trace: {trace_path}  samples={report['samples']}  "
+        f"elapsed={report['elapsed_seconds']:g}s"
+    )
+    print(f"policy: {_policy_line(policy)}")
+    print("actions")
+    for action in Action:
+        seconds = report["action_seconds"][action.value]
+        percent = report["action_percent"][action.value]
+        share = "n/a" if percent is None else f"{percent:.1f}%"
+        samples = report["action_samples"][action.value]
+        print(f"  {action.value:<7} {seconds:>8g}s  {share:>6}  {samples} samples")
+    print(
+        f"transitions: {report['action_transitions']} action, "
+        f"{report['decision_transitions']} decision"
+    )
+    for record in report["transitions"][: args.transition_limit]:
+        observation = record["observation"]
+        temperature = observation["temperature_c"]
+        temperature_text = "n/a" if temperature is None else f"{temperature:g}C"
+        decision = record["decision"]
+        print(
+            f"  {record['observed_at']}  {decision['action']:<7} "
+            f"{decision['reason']:<18} temp={temperature_text}"
+        )
+    remaining = len(report["transitions"]) - args.transition_limit
+    if remaining > 0:
+        print(f"  ... {remaining} more; use --json for the complete replay")
+    return 0
+
+
+def cmd_sweep(args):
+    if args.top < 1:
+        raise StateError("--top must be at least 1")
+    trace_path = Path(args.trace).expanduser().resolve()
+    grid_path = Path(args.grid).expanduser().resolve()
+    if not grid_path.is_file():
+        raise StateError(f"grid file does not exist: {grid_path}")
+    if args.config_path:
+        config_path = Path(args.config_path).expanduser().resolve()
+        if not config_path.is_file():
+            raise StateError(f"configuration file does not exist: {config_path}")
+    else:
+        # Like simulate, a sweep is a pure offline command.
+        config_path = AppPaths.from_environment().config
+
+    base = load_policy(config_path)
+    try:
+        grid_text = grid_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StateError(f"{grid_path}: cannot read grid: {exc}") from exc
+    grid = parse_grid(grid_text, str(grid_path))
+    observations = load_trace(trace_path)
+    report = run_sweep(
+        base,
+        grid,
+        observations,
+        engine=args.engine,
+        hot_ref_c=args.hot_ref,
+        low_battery_ref_pct=args.low_battery_ref,
+    )
+    report["trace"] = str(trace_path)
+    report["config_source"] = str(config_path) if config_path.exists() else "defaults"
+    report["grid_source"] = str(grid_path)
+    if args.json:
+        _json_dump(report)
+        return 0
+
+    facts = report["trace_facts"]
+    print(
+        f"trace: {trace_path}  samples={report['samples']}  "
+        f"elapsed={report['elapsed_seconds']:g}s  engine={report['engine']}"
+    )
+
+    def coverage(value):
+        return "n/a" if value is None else f"{100 * value:.0f}%"
+
+    print(
+        f"trace facts: {facts['hot_degc_seconds']:g} degC*s above "
+        f"{facts['hot_reference_c']:g}C (temp coverage "
+        f"{coverage(facts['temperature_coverage'])}), "
+        f"{facts['high_soc_seconds']:g}s at "
+        f">={facts['high_soc_reference_pct']:g}% charge, "
+        f"{facts['equivalent_full_cycles']:.3f} equivalent full cycles"
+    )
+    print(
+        f"candidates: {report['candidates_evaluated']} evaluated, "
+        f"{report['candidates_rejected']} invalid, "
+        f"pareto front {report['pareto_front_size']}"
+    )
+    baseline = report["baseline"]["metrics"]
+    print(
+        f"baseline: run {baseline['run_seconds']:g}s  "
+        f"hot {baseline['hot_run_degc_seconds']:g} degC*s  "
+        f"low-battery {baseline['low_battery_run_seconds']:g}s  "
+        f"transitions {baseline['action_transitions']}"
+    )
+
+    def efficiency_text(value):
+        return "n/a" if value is None else f"{100 * value:.0f}%"
+
+    bound = report["baseline"]["clairvoyant"]
+    threshold = bound["hot_only_hindsight_threshold_c"]
+    threshold_text = "not binding" if threshold is None else f"{threshold:g}C"
+    print(
+        f"joint clairvoyant bound: {bound['bound_run_seconds']:g}s runnable at "
+        "the baseline's own exposure "
+        f"(efficiency {efficiency_text(bound['efficiency'])}, "
+        f"gap {bound['gap_seconds']:g}s, hot-only cutoff {threshold_text})"
+    )
+    print("   run_s     hot_degC*s  lowbatt_s  trans   eff  overrides")
+    for candidate in report["candidates"][: args.top]:
+        metrics = candidate["metrics"]
+        marker = "*" if candidate["pareto_optimal"] else " "
+        overrides = json.dumps(candidate["overrides"], sort_keys=True)
+        efficiency = efficiency_text(candidate["clairvoyant"]["efficiency"])
+        print(
+            f" {marker} {metrics['run_seconds']:>7g}  "
+            f"{metrics['hot_run_degc_seconds']:>10g}  "
+            f"{metrics['low_battery_run_seconds']:>9g}  "
+            f"{metrics['action_transitions']:>5}  {efficiency:>4}  {overrides}"
+        )
+    remaining = len(report["candidates"]) - args.top
+    if remaining > 0:
+        print(f"  ... {remaining} more; use --json for the complete report")
+    print(
+        "* pareto-optimal on (run seconds up, hot exposure down, low-battery run down)"
+    )
+    print(
+        "note: metrics re-weight the recorded trace under each policy's "
+        "actions; they do not simulate temperature or charge and are not "
+        "battery-life predictions. Efficiency compares permitted work with "
+        "the exact joint fractional clairvoyant schedule at the same recorded "
+        "exposure"
+    )
+    return 0
+
+
 def cmd_config(args):
     paths = _paths()
-    defaults = PolicyConfig().to_dict()
     if getattr(args, "init", False):
-        atomic_json_write(paths.config, defaults)
+        if paths.config.exists() and not getattr(args, "force", False):
+            raise StateError(
+                f"{paths.config} already exists; pass --force to replace it"
+            )
+        atomic_json_write(paths.config, PolicyConfig().to_dict())
+        print(f"wrote {paths.config}")
     cfg = load_policy(paths.config)
+    if getattr(args, "check", False):
+        print(f"{paths.config}: valid")
+        return 0
     print(f"policy: {paths.config}\n")
-    print(json.dumps(cfg.to_dict(), indent=2))
+    _json_dump(cfg.to_dict())
     if not paths.config.exists():
-        print("\n(no config.json yet; defaults shown. run `train-guard config --init` to write it)")
-    if getattr(args, "init", False):
-        print(f"\nwrote {paths.config}")
+        print("(defaults shown; use `train-guard config --init` to write them)")
     return 0
+
+
+def _doctor_payload(paths):
+    checks = []
+    try:
+        policy = load_policy(paths.config)
+        checks.append({"name": "config", "ok": True, "detail": policy.to_dict()})
+    except ConfigError as exc:
+        checks.append({"name": "config", "ok": False, "detail": str(exc)})
+
+    try:
+        with tempfile.NamedTemporaryFile(dir=paths.home):
+            pass
+        checks.append(
+            {
+                "name": "state_directory",
+                "ok": True,
+                "detail": str(paths.home),
+            }
+        )
+    except OSError as exc:
+        checks.append({"name": "state_directory", "ok": False, "detail": str(exc)})
+
+    store = JobStore(paths)
+    state_errors = store.audit_state()
+    checks.append(
+        {
+            "name": "state_files",
+            "ok": not state_errors,
+            "detail": {"errors": state_errors},
+        }
+    )
+
+    observation = SensorReader().sample()
+    checks.append(
+        {
+            "name": "sensors",
+            "ok": True,
+            "detail": observation.to_dict(),
+            "advisory": bool(observation.warnings),
+        }
+    )
+
+    stale = []
+    for spec in store.list_specs():
+        try:
+            _pid, alive = _guard_status(store, spec.name)
+        except StateError:
+            continue
+        if not alive:
+            stale.append(spec.name)
+    checks.append(
+        {
+            "name": "supervisors",
+            "ok": not stale,
+            "detail": {"stale": stale},
+        }
+    )
+    login_agent_present = _agent_installed()
+    checks.append(
+        {
+            "name": "login_agent",
+            "ok": True,
+            "detail": {"installed": login_agent_present},
+            "advisory": not login_agent_present,
+        }
+    )
+    return {
+        "schema_version": 1,
+        "ok": all(check["ok"] for check in checks),
+        "version": __version__,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "checks": checks,
+    }
+
+
+def cmd_doctor(args):
+    payload = _doctor_payload(_paths())
+    if args.json:
+        _json_dump(payload)
+    else:
+        print(
+            f"train-guard {payload['version']}  Python {payload['python']}  "
+            f"{payload['platform']}"
+        )
+        for check in payload["checks"]:
+            label = "ok" if check["ok"] else "FAIL"
+            if check.get("advisory"):
+                label = "note"
+            detail = check["detail"]
+            if check["name"] == "sensors":
+                detail = ", ".join(detail["warnings"]) or "available"
+            print(f"  {label:<4} {check['name']}: {detail}")
+    return 0 if payload["ok"] else 1
 
 
 def cmd_restart_persisted(args):
@@ -868,7 +1256,9 @@ def cmd_restart_persisted(args):
         except (ConfigError, OSError, StateError) as exc:
             failures += 1
             print(f"[restart] {spec.name}: {exc}", file=sys.stderr)
-    print("[restart] done (commands were restarted or reattached; no RAM state was restored)")
+    print(
+        "[restart] done (commands were restarted or reattached; no RAM state was restored)"
+    )
     return 1 if failures else 0
 
 
@@ -890,16 +1280,22 @@ def cmd_install_agent(args):
     if SYSTEM == "Darwin":
         plist = HOME / "Library/LaunchAgents/com.trainguard.resume.plist"
         plist.parent.mkdir(parents=True, exist_ok=True)
-        plist.write_bytes(plistlib.dumps({
-            "Label": "com.trainguard.resume",
-            "ProgramArguments": restart_argv,
-            "RunAtLoad": True,
-            "ProcessType": "Background",
-            "StandardOutPath": str(LOGDIR / "restart.log"),
-            "StandardErrorPath": str(LOGDIR / "restart.log"),
-        }))
+        plist.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "com.trainguard.resume",
+                    "ProgramArguments": restart_argv,
+                    "RunAtLoad": True,
+                    "ProcessType": "Background",
+                    "StandardOutPath": str(LOGDIR / "restart.log"),
+                    "StandardErrorPath": str(LOGDIR / "restart.log"),
+                }
+            )
+        )
         subprocess.run(["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL)
-        subprocess.run(["launchctl", "load", "-w", str(plist)], stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["launchctl", "load", "-w", str(plist)], stderr=subprocess.DEVNULL
+        )
         print(f"[train-guard] login restart agent installed (launchd): {plist}")
     elif SYSTEM == "Linux":
         unit = HOME / ".config/systemd/user/trainguard-resume.service"
@@ -913,14 +1309,23 @@ ExecStart={exec_start}
 [Install]
 WantedBy=default.target
 """)
-        subprocess.run(["systemctl", "--user", "daemon-reload"], stderr=subprocess.DEVNULL)
-        subprocess.run(["systemctl", "--user", "enable", "trainguard-resume.service"], stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"], stderr=subprocess.DEVNULL
+        )
+        subprocess.run(
+            ["systemctl", "--user", "enable", "trainguard-resume.service"],
+            stderr=subprocess.DEVNULL,
+        )
         print(f"[train-guard] login restart service installed (systemd --user): {unit}")
-        print("  tip: `loginctl enable-linger $USER` to also restart without an active GUI session.")
+        print(
+            "  tip: `loginctl enable-linger $USER` to also restart without an active GUI session."
+        )
     elif SYSTEM == "Windows":
         task = "TrainGuardRestart"
         cmdline = subprocess.list2cmdline(restart_argv)
-        subprocess.run(["schtasks", "/Create", "/TN", task, "/SC", "ONLOGON", "/TR", cmdline, "/F"])
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", task, "/SC", "ONLOGON", "/TR", cmdline, "/F"]
+        )
         print(f"[train-guard] login restart task installed (schtasks): {task}")
     else:
         sys.stderr.write("install-agent: unsupported OS\n")
@@ -937,7 +1342,10 @@ def cmd_uninstall_agent(args):
         except FileNotFoundError:
             pass
     elif SYSTEM == "Linux":
-        subprocess.run(["systemctl", "--user", "disable", "trainguard-resume.service"], stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["systemctl", "--user", "disable", "trainguard-resume.service"],
+            stderr=subprocess.DEVNULL,
+        )
         try:
             (HOME / ".config/systemd/user/trainguard-resume.service").unlink()
         except FileNotFoundError:
@@ -945,24 +1353,37 @@ def cmd_uninstall_agent(args):
     elif SYSTEM == "Windows":
         subprocess.run(["schtasks", "/Delete", "/TN", "TrainGuardRestart", "/F"])
         # Clean up the v0.1 task name too, if present.
-        subprocess.run(["schtasks", "/Delete", "/TN", "TrainGuardResume", "/F"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["schtasks", "/Delete", "/TN", "TrainGuardResume", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     print("[train-guard] login agent removed.")
     return 0
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="train-guard", description="Battery and thermal supervisor for long compute jobs.")
+    p = argparse.ArgumentParser(
+        prog="train-guard",
+        description="Battery and thermal supervisor for long compute jobs.",
+    )
     p.add_argument("--version", action="version", version=f"train-guard {__version__}")
     sub = p.add_subparsers(dest="cmd")
 
     r = sub.add_parser("run", help="launch + supervise a new job")
     r.add_argument("--name")
     rg = r.add_mutually_exclusive_group()
-    rg.add_argument("--restart-on-login", action="store_true",
-                    help="start this command as a new process after reboot/login")
-    rg.add_argument("--persist", action="store_true", dest="restart_on_login",
-                    help="deprecated alias for --restart-on-login")
+    rg.add_argument(
+        "--restart-on-login",
+        action="store_true",
+        help="start this command as a new process after reboot/login",
+    )
+    rg.add_argument(
+        "--persist",
+        action="store_true",
+        dest="restart_on_login",
+        help="deprecated alias for --restart-on-login",
+    )
     r.add_argument("--cwd")
     r.add_argument("cmd", nargs=argparse.REMAINDER)
     r.set_defaults(fn=cmd_run)
@@ -972,10 +1393,17 @@ def build_parser():
     a.add_argument("--match")
     a.add_argument("--pid", type=int)
     ag = a.add_mutually_exclusive_group()
-    ag.add_argument("--restart-on-login", action="store_true",
-                    help="reattach by pattern after login; --start may launch a new process")
-    ag.add_argument("--persist", action="store_true", dest="restart_on_login",
-                    help="deprecated alias for --restart-on-login")
+    ag.add_argument(
+        "--restart-on-login",
+        action="store_true",
+        help="reattach by pattern after login; --start may launch a new process",
+    )
+    ag.add_argument(
+        "--persist",
+        action="store_true",
+        dest="restart_on_login",
+        help="deprecated alias for --restart-on-login",
+    )
     a.add_argument("--cwd")
     a.add_argument("--start")
     a.set_defaults(fn=cmd_attach)
@@ -988,12 +1416,24 @@ def build_parser():
     listing.add_argument("--json", action="store_true")
     listing.set_defaults(fn=cmd_list)
 
-    for nm, fn, hlp in [("restart-persisted", cmd_restart_persisted,
-                         "restart or reattach configured jobs after login"),
-                        ("resume", cmd_resume,
-                         "compatibility alias for restart-persisted (does not restore RAM)"),
-                        ("install-agent", cmd_install_agent, "restart configured jobs after reboot/login"),
-                        ("uninstall-agent", cmd_uninstall_agent, "remove the login agent")]:
+    for nm, fn, hlp in [
+        (
+            "restart-persisted",
+            cmd_restart_persisted,
+            "restart or reattach configured jobs after login",
+        ),
+        (
+            "resume",
+            cmd_resume,
+            "compatibility alias for restart-persisted (does not restore RAM)",
+        ),
+        (
+            "install-agent",
+            cmd_install_agent,
+            "restart configured jobs after reboot/login",
+        ),
+        ("uninstall-agent", cmd_uninstall_agent, "remove the login agent"),
+    ]:
         s = sub.add_parser(nm, help=hlp)
         s.set_defaults(fn=fn)
 
@@ -1018,19 +1458,85 @@ def build_parser():
     events.add_argument("--json", action="store_true")
     events.set_defaults(fn=cmd_events)
 
+    simulate = sub.add_parser(
+        "simulate",
+        help="replay a policy against observation or event JSONL",
+    )
+    simulate.add_argument("trace")
+    simulate.add_argument("--config", dest="config_path")
+    simulate.add_argument(
+        "--compare-config",
+        dest="compare_config_path",
+        help="replay a candidate and report its delta from the baseline",
+    )
+    simulate.add_argument(
+        "--transition-limit",
+        type=int,
+        default=20,
+        help="maximum transition rows in human output (default: 20)",
+    )
+    simulate.add_argument("--json", action="store_true")
+    simulate.set_defaults(fn=cmd_simulate)
+
+    sweep = sub.add_parser(
+        "sweep",
+        help="evaluate a grid of policies against a recorded trace",
+    )
+    sweep.add_argument("trace")
+    sweep.add_argument(
+        "--grid",
+        required=True,
+        help="JSON file mapping policy fields to candidate value lists",
+    )
+    sweep.add_argument("--config", dest="config_path")
+    sweep.add_argument(
+        "--engine",
+        choices=("auto", "python", "native"),
+        default="auto",
+        help="evaluation engine; native is unavailable until its kernel is built",
+    )
+    sweep.add_argument(
+        "--hot-ref",
+        dest="hot_ref",
+        type=float,
+        default=DEFAULT_HOT_REFERENCE_C,
+        help="temperature reference for hot exposure (default: 35)",
+    )
+    sweep.add_argument(
+        "--low-battery-ref",
+        dest="low_battery_ref",
+        type=float,
+        default=DEFAULT_LOW_BATTERY_REFERENCE_PCT,
+        help="charge percentage treated as low battery (default: 20)",
+    )
+    sweep.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="candidate rows in human output (default: 10)",
+    )
+    sweep.add_argument("--json", action="store_true")
+    sweep.set_defaults(fn=cmd_sweep)
+
     up = sub.add_parser("unpersist", help="forget a persisted job")
     up.add_argument("name")
     up.set_defaults(fn=cmd_unpersist)
-    cf = sub.add_parser("config", help="show/init policy")
+    cf = sub.add_parser("config", help="show, create or validate policy")
     cf.add_argument("--init", action="store_true")
+    cf.add_argument("--force", action="store_true")
+    cf.add_argument("--check", action="store_true")
     cf.set_defaults(fn=cmd_config)
+
+    doctor = sub.add_parser("doctor", help="check the local installation")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(fn=cmd_doctor)
     return p
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
-        if argv and argv[0] == "__supervise":   # internal
+        if argv and argv[0] == "__supervise":  # internal
             if len(argv) not in {2, 4}:
                 raise StateError("invalid internal supervisor arguments")
             excluded_identity = None
@@ -1041,18 +1547,19 @@ def main(argv=None):
                         create_time=float(argv[3]),
                     )
                 except (TypeError, ValueError) as exc:
-                    raise StateError(
-                        "invalid launching CLI identity"
-                    ) from exc
+                    raise StateError("invalid launching CLI identity") from exc
             return cmd_supervise(argv[1], excluded_identity)
         parser = build_parser()
         args = parser.parse_args(argv)
         if not getattr(args, "fn", None):
             return cmd_status(args)
         return args.fn(args)
-    except (ConfigError, OSError, StateError) as exc:
+    except (ConfigError, OSError, StateError, SweepError, TraceError) as exc:
         sys.stderr.write(f"train-guard: {exc}\n")
         return 2
+    except KeyboardInterrupt:
+        sys.stderr.write("train-guard: interrupted\n")
+        return 130
 
 
 if __name__ == "__main__":

@@ -89,11 +89,22 @@ train-guard status
 train-guard events bigtrain --limit 10
 train-guard list --json
 train-guard status --json
+train-guard doctor --json
 train-guard stop bigtrain
 train-guard stop bigtrain --kill
 # After status reports a dead supervisor, release its recorded process changes.
 train-guard recover bigtrain
 train-guard config --init
+train-guard config --check
+
+# Replay and compare policies without starting a worker or reading sensors.
+train-guard simulate examples/power-trace.jsonl --json
+train-guard simulate examples/power-trace.jsonl \
+  --compare-config examples/battery-enabled-policy.json
+
+# Evaluate a Cartesian grid of policy values on the same trace.
+train-guard sweep examples/power-trace.jsonl \
+  --grid examples/policy-grid.json --engine python
 ```
 
 ### Sleep is not reboot
@@ -148,6 +159,52 @@ pack range.
 Version 0.1 keys `temp_ecore_c` and `temp_charge_ecore_c` still load for
 compatibility. New configurations use `gentle` because no supported API
 guarantees a particular core class.
+
+## Diagnostics and offline evaluation
+
+`train-guard config --check` validates the complete policy without starting a
+job. `train-guard doctor [--json]` checks the configuration, state-directory
+access, sensors, supervisor liveness and every metadata, runtime and login
+restart record. Corrupt and orphaned recovery state is reported but never
+repaired or deleted automatically. `status --json` follows the same rule and
+returns a non-zero status while still emitting a versioned, machine-readable
+report. These JSON reports use `schema_version: 1`.
+
+`simulate` accepts raw observation JSON Lines or structured event records that
+contain an `observation`. It never creates the state directory, samples a
+sensor or controls a process. Each observation is treated as holding until the
+next timestamp; the last observation therefore has zero duration unless a
+handled terminal event from the live journal closes the interval. The first
+row in `transitions` is the initial decision, so a report contains
+`decision_transitions + 1` transition rows.
+
+The included trace covers normal AC work, warm charging, thermal hysteresis and
+one battery interval. With the default policy its hand-checked 1,800 seconds
+split into 600 seconds `full`, 300 seconds `gentle` and 900 seconds `stop`.
+Comparison mode evaluates the baseline and candidate on the same immutable
+observations and reports action-second and percentage-point deltas,
+disagreement duration and transition deltas. Canonical SHA-256 fingerprints
+identify the policy and observation values used by a report.
+
+`sweep` validates and deduplicates the Cartesian product in a JSON grid such as
+`{"temp_pause_c": [40, 42, 44], "run_on_battery": [true, false]}`. It reports
+permitted work, hot degree-seconds while work is permitted, low-battery work,
+trace-level facts and the Pareto front. Invalid combinations are counted and
+shown rather than silently coerced.
+
+Each candidate also carries an exact fractional clairvoyant bound at its own
+hot and low-battery exposure budgets. This is one joint two-budget schedule;
+the separate hot-only and low-battery-only optima remain diagnostics and are
+not combined with `min`. The reported temperature cutoff is explicitly the
+hot-only hindsight cutoff, not a threshold for the joint schedule. Tests compare
+the joint optimizer with an independent exact-rational enumeration of compact
+linear-program vertices.
+
+Replay and sweep re-weight a trace recorded under the original actions. They do
+not model how another policy would have changed temperature or charge, and are
+not battery-life or throughput predictions. `auto` currently uses the Python
+policy engine. The `native` engine selector is reserved for the optional replay
+kernel and fails explicitly while that kernel is absent.
 
 ## Supervisor loop
 

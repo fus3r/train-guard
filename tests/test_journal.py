@@ -200,3 +200,8 @@ def test_events_status_and_list_have_machine_readable_output(
             "state": "gentle",
         }
     ]
+
+
+def test_events_rejects_a_non_positive_limit(capsys):
+    assert cli.main(["events", "training", "--limit", "0"]) == 2
+    assert "--limit must be at least 1" in capsys.readouterr().err

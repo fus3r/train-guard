@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -31,8 +31,45 @@ class PolicyConfig:
     charge_cool_until_pct: float = 80.0
     temp_charge_gentle_c: float = 35.0
 
+    def __post_init__(self) -> None:
+        """Give directly constructed policies the loader's core invariants."""
+
+        for name in (
+            "poll",
+            "battery_floor_pct",
+            "temp_gentle_c",
+            "temp_pause_c",
+            "temp_resume_c",
+            "charge_cool_until_pct",
+            "temp_charge_gentle_c",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(f"{name} must be a number")
+            # Normalize integers and negative zero before serialization and
+            # fingerprinting. The dataclass is frozen, so use its escape hatch.
+            object.__setattr__(self, name, float(value) + 0.0)
+
+        if self.temp_resume_c >= self.temp_pause_c:
+            raise ConfigError("temp_resume_c must be lower than temp_pause_c")
+        if self.temp_gentle_c > self.temp_pause_c:
+            raise ConfigError("temp_gentle_c cannot exceed temp_pause_c")
+        if self.temp_charge_gentle_c > self.temp_pause_c:
+            raise ConfigError("temp_charge_gentle_c cannot exceed temp_pause_c")
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "poll": self.poll,
+            "run_on_battery": self.run_on_battery,
+            "battery_floor_pct": self.battery_floor_pct,
+            "battery_band": self.battery_band,
+            "ac_band": self.ac_band,
+            "temp_gentle_c": self.temp_gentle_c,
+            "temp_pause_c": self.temp_pause_c,
+            "temp_resume_c": self.temp_resume_c,
+            "charge_cool_until_pct": self.charge_cool_until_pct,
+            "temp_charge_gentle_c": self.temp_charge_gentle_c,
+        }
 
 
 _FIELD_NAMES = {field.name for field in fields(PolicyConfig)}
@@ -112,12 +149,6 @@ def policy_from_mapping(values: Mapping[str, Any]) -> PolicyConfig:
         ),
     )
 
-    if config.temp_resume_c >= config.temp_pause_c:
-        raise ConfigError("temp_resume_c must be lower than temp_pause_c")
-    if config.temp_gentle_c > config.temp_pause_c:
-        raise ConfigError("temp_gentle_c cannot exceed temp_pause_c")
-    if config.temp_charge_gentle_c > config.temp_pause_c:
-        raise ConfigError("temp_charge_gentle_c cannot exceed temp_pause_c")
     return config
 
 
@@ -171,7 +202,9 @@ class ConfigWatcher:
         self._fingerprint = fingerprint
         try:
             candidate = (
-                parse_policy_text(raw.decode("utf-8"), str(self.path)) if raw else PolicyConfig()
+                parse_policy_text(raw.decode("utf-8"), str(self.path))
+                if raw
+                else PolicyConfig()
             )
         except (UnicodeDecodeError, ConfigError) as exc:
             error = (

@@ -1,0 +1,7 @@
+{"source":"ac","percent":55.0,"temperature_c":30.0,"charging":true,"observed_at":"2026-07-26T09:00:00Z","warnings":[]}
+{"source":"ac","percent":60.0,"temperature_c":36.0,"charging":true,"observed_at":"2026-07-26T09:05:00Z","warnings":[]}
+{"source":"ac","percent":65.0,"temperature_c":42.0,"charging":true,"observed_at":"2026-07-26T09:10:00Z","warnings":[]}
+{"source":"ac","percent":68.0,"temperature_c":39.0,"charging":true,"observed_at":"2026-07-26T09:15:00Z","warnings":[]}
+{"source":"ac","percent":70.0,"temperature_c":36.0,"charging":false,"observed_at":"2026-07-26T09:20:00Z","warnings":[]}
+{"source":"battery","percent":60.0,"temperature_c":34.0,"charging":false,"observed_at":"2026-07-26T09:25:00Z","warnings":[]}
+{"source":"ac","percent":58.0,"temperature_c":33.0,"charging":false,"observed_at":"2026-07-26T09:30:00Z","warnings":[]}
