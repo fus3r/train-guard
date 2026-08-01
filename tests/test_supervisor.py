@@ -96,13 +96,20 @@ def test_readiness_uses_popen_and_rechecks_after_observed_exit(
             AssertionError("the Popen handle must be authoritative")
         ),
     )
-    cli._wait_for_supervisor_ready(
-        store,
-        "quick",
-        expected,
-        supervisor=type("Child", (), {"poll": staticmethod(short_lived_poll)})(),
-        timeout=0.2,
-    )
+    # The poll writes readiness but consumes the remaining deadline. The
+    # handshake must still be read immediately after the observed exit.
+    clock = iter((0.0, 0.1, 0.3))
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(cli.time, "monotonic", lambda: next(clock))
+        cli._wait_for_supervisor_ready(
+            store,
+            "quick",
+            expected,
+            supervisor=type(
+                "Child", (), {"poll": staticmethod(short_lived_poll)}
+            )(),
+            timeout=0.2,
+        )
     assert store.read_ready("quick") is None
 
     def exited_before_capture(*_args, **_kwargs):

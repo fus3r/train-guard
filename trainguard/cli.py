@@ -292,19 +292,24 @@ def _wait_for_supervisor_ready(
 ):
     """Wait for the child-written handshake before reporting success."""
 
+    def consume_ready():
+        ready = store.read_ready(name)
+        if ready is None:
+            return False
+        if ready != expected:
+            raise StateError(
+                f"supervisor identity changed while starting guard '{name}'"
+            )
+        # Reap a short-lived child if it has already exited.
+        if supervisor is not None and hasattr(supervisor, "poll"):
+            supervisor.poll()
+        store.clear_ready(name)
+        return True
+
     deadline = time.monotonic() + timeout
     exited = False
     while time.monotonic() < deadline:
-        ready = store.read_ready(name)
-        if ready is not None:
-            if ready != expected:
-                raise StateError(
-                    f"supervisor identity changed while starting guard '{name}'"
-                )
-            # Reap a short-lived child if it has already exited.
-            if supervisor is not None and hasattr(supervisor, "poll"):
-                supervisor.poll()
-            store.clear_ready(name)
+        if consume_ready():
             return
         if exited:
             log_path = store.paths.logs / f"{name}.guard.log"
@@ -313,6 +318,11 @@ def _wait_for_supervisor_ready(
                 f"ready; inspect {log_path}"
             )
         exited = _supervisor_exited(supervisor, expected)
+        # The child writes readiness before a clean immediate exit. Read it
+        # once more now instead of requiring another loop iteration before
+        # the deadline; a slow fsync made that timing assumption flaky.
+        if exited and consume_ready():
+            return
         if not exited:
             time.sleep(0.02)
     raise StateError(
