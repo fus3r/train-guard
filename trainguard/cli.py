@@ -13,7 +13,6 @@ import argparse
 import json
 import os
 import platform
-import plistlib
 import re
 import shlex
 import subprocess
@@ -32,6 +31,12 @@ if __package__:
     from .config import ConfigError, PolicyConfig, load_policy
     from .journal import EventJournal
     from .model import Action, PowerSource, ProcessIdentity
+    from .platforms import (
+        PlatformError,
+        agent_installed,
+        install_agent,
+        uninstall_agent,
+    )
     from .processes import (
         ProcessController,
         identity_is_alive,
@@ -65,6 +70,7 @@ else:  # Keep direct execution from a checkout working.
     from config import ConfigError, PolicyConfig, load_policy
     from journal import EventJournal
     from model import Action, PowerSource, ProcessIdentity
+    from platforms import PlatformError, agent_installed, install_agent, uninstall_agent
     from processes import (
         ProcessController,
         identity_is_alive,
@@ -523,27 +529,7 @@ def cmd_attach(args):
 
 
 def _agent_installed():
-    if SYSTEM == "Darwin":
-        return (HOME / "Library/LaunchAgents/com.trainguard.resume.plist").exists()
-    if SYSTEM == "Linux":
-        return (HOME / ".config/systemd/user/trainguard-resume.service").exists()
-    if SYSTEM == "Windows":
-        try:
-            for task in ("TrainGuardRestart", "TrainGuardResume"):
-                if (
-                    subprocess.run(
-                        ["schtasks", "/Query", "/TN", task],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=5,
-                    ).returncode
-                    == 0
-                ):
-                    return True
-            return False
-        except (OSError, subprocess.SubprocessError):
-            return False
-    return False
+    return agent_installed(AppPaths.from_environment(), SYSTEM)
 
 
 def _guard_payloads(store):
@@ -1285,89 +1271,19 @@ def cmd_unpersist(args):
 
 
 def cmd_install_agent(args):
-    _ensure_dirs()
+    paths = _paths()
     restart_argv = [sys.executable, str(Path(__file__).resolve()), "restart-persisted"]
-    if SYSTEM == "Darwin":
-        plist = HOME / "Library/LaunchAgents/com.trainguard.resume.plist"
-        plist.parent.mkdir(parents=True, exist_ok=True)
-        plist.write_bytes(
-            plistlib.dumps(
-                {
-                    "Label": "com.trainguard.resume",
-                    "ProgramArguments": restart_argv,
-                    "RunAtLoad": True,
-                    "ProcessType": "Background",
-                    "StandardOutPath": str(LOGDIR / "restart.log"),
-                    "StandardErrorPath": str(LOGDIR / "restart.log"),
-                }
-            )
-        )
-        subprocess.run(["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL)
-        subprocess.run(
-            ["launchctl", "load", "-w", str(plist)], stderr=subprocess.DEVNULL
-        )
-        print(f"[train-guard] login restart agent installed (launchd): {plist}")
-    elif SYSTEM == "Linux":
-        unit = HOME / ".config/systemd/user/trainguard-resume.service"
-        unit.parent.mkdir(parents=True, exist_ok=True)
-        exec_start = shlex.join(restart_argv)
-        unit.write_text(f"""[Unit]
-Description=train-guard: restart configured jobs at login
-[Service]
-Type=oneshot
-ExecStart={exec_start}
-[Install]
-WantedBy=default.target
-""")
-        subprocess.run(
-            ["systemctl", "--user", "daemon-reload"], stderr=subprocess.DEVNULL
-        )
-        subprocess.run(
-            ["systemctl", "--user", "enable", "trainguard-resume.service"],
-            stderr=subprocess.DEVNULL,
-        )
-        print(f"[train-guard] login restart service installed (systemd --user): {unit}")
+    target = install_agent(paths, restart_argv, SYSTEM)
+    print(f"[train-guard] login restart agent installed: {target}")
+    if SYSTEM == "Linux":
         print(
             "  tip: `loginctl enable-linger $USER` to also restart without an active GUI session."
         )
-    elif SYSTEM == "Windows":
-        task = "TrainGuardRestart"
-        cmdline = subprocess.list2cmdline(restart_argv)
-        subprocess.run(
-            ["schtasks", "/Create", "/TN", task, "/SC", "ONLOGON", "/TR", cmdline, "/F"]
-        )
-        print(f"[train-guard] login restart task installed (schtasks): {task}")
-    else:
-        sys.stderr.write("install-agent: unsupported OS\n")
-        return 2
     return 0
 
 
 def cmd_uninstall_agent(args):
-    if SYSTEM == "Darwin":
-        plist = HOME / "Library/LaunchAgents/com.trainguard.resume.plist"
-        subprocess.run(["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL)
-        try:
-            plist.unlink()
-        except FileNotFoundError:
-            pass
-    elif SYSTEM == "Linux":
-        subprocess.run(
-            ["systemctl", "--user", "disable", "trainguard-resume.service"],
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            (HOME / ".config/systemd/user/trainguard-resume.service").unlink()
-        except FileNotFoundError:
-            pass
-    elif SYSTEM == "Windows":
-        subprocess.run(["schtasks", "/Delete", "/TN", "TrainGuardRestart", "/F"])
-        # Clean up the v0.1 task name too, if present.
-        subprocess.run(
-            ["schtasks", "/Delete", "/TN", "TrainGuardResume", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    uninstall_agent(_paths(), SYSTEM)
     print("[train-guard] login agent removed.")
     return 0
 
@@ -1564,7 +1480,14 @@ def main(argv=None):
         if not getattr(args, "fn", None):
             return cmd_status(args)
         return args.fn(args)
-    except (ConfigError, OSError, StateError, SweepError, TraceError) as exc:
+    except (
+        ConfigError,
+        OSError,
+        PlatformError,
+        StateError,
+        SweepError,
+        TraceError,
+    ) as exc:
         sys.stderr.write(f"train-guard: {exc}\n")
         return 2
     except KeyboardInterrupt:
