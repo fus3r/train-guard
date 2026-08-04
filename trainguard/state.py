@@ -89,13 +89,28 @@ def atomic_json_write(path: Path, value: Any) -> None:
     _atomic_write(path, text)
 
 
+def _read_text(path: Path) -> str:
+    if not _WINDOWS:
+        return path.read_text(encoding="utf-8")
+
+    # A concurrent replace can briefly lock the destination on Windows.
+    for attempt in range(3):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if attempt == 2:
+                raise
+            time.sleep(0.01)
+    raise AssertionError("unreachable")
+
+
 def read_json(path: Path) -> Any:
     def reject_non_finite(value: str) -> None:
         raise ValueError(f"non-finite JSON number {value}")
 
     try:
         return json.loads(
-            path.read_text(encoding="utf-8"),
+            _read_text(path),
             parse_constant=reject_non_finite,
         )
     except FileNotFoundError:

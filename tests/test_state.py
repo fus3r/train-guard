@@ -152,6 +152,20 @@ def test_atomic_json_write_replaces_fully_and_retries_windows_reader(
     assert read_json(path) == {"version": 2}
     assert len(attempts) == 3
     assert list(tmp_path.iterdir()) == [path]
+
+    real_read_text = Path.read_text
+    read_attempts = []
+
+    def sharing_violation_then_read(target, *args, **kwargs):
+        read_attempts.append(target)
+        if len(read_attempts) < 3:
+            raise PermissionError("sharing violation")
+        return real_read_text(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", sharing_violation_then_read)
+    assert read_json(path) == {"version": 2}
+    assert len(read_attempts) == 3
+
     with pytest.raises(StateError, match="valid JSON"):
         atomic_json_write(path, {"value": float("nan")})
     assert read_json(path) == {"version": 2}
