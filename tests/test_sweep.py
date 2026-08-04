@@ -10,7 +10,6 @@ from trainguard.config import ConfigError, PolicyConfig
 from trainguard.simulation import load_trace
 from trainguard.sweep import SweepError, expand_grid, parse_grid, run_sweep
 
-
 EXAMPLE_TRACE = Path(__file__).parents[1] / "examples" / "power-trace.jsonl"
 
 
@@ -75,10 +74,7 @@ def test_direct_policy_construction_enforces_sweep_invariants():
     with pytest.raises(ConfigError, match="must be a number"):
         PolicyConfig(temp_pause_c="hot")  # type: ignore[arg-type]
 
-    assert (
-        PolicyConfig(temp_pause_c=42).to_dict()
-        == PolicyConfig(temp_pause_c=42.0).to_dict()
-    )
+    assert PolicyConfig(temp_pause_c=42).to_dict() == PolicyConfig(temp_pause_c=42.0).to_dict()
     assert str(PolicyConfig(battery_floor_pct=-0.0).battery_floor_pct) == "0.0"
 
 

@@ -50,11 +50,7 @@ class CostFrontier:
             return self.free_seconds + self.value_prefix[-1]
         previous_cost = self.cost_prefix[index - 1] if index else 0.0
         previous_value = self.value_prefix[index - 1] if index else 0.0
-        return (
-            self.free_seconds
-            + previous_value
-            + (budget - previous_cost) / self.rates[index]
-        )
+        return self.free_seconds + previous_value + (budget - previous_cost) / self.rates[index]
 
     def marginal_rate_at(self, budget: float) -> Optional[float]:
         """Rate bought by the budget's final fraction, if it still binds."""
@@ -171,9 +167,7 @@ def build_joint_frontier(
     free_low_seconds = 0.0
     non_low: list[tuple[float, float]] = []
     low: list[tuple[float, float]] = []
-    for (hot_rate, duration), (low_rate, low_duration) in zip(
-        hot_rated, low_battery_rated
-    ):
+    for (hot_rate, duration), (low_rate, low_duration) in zip(hot_rated, low_battery_rated):
         if duration != low_duration:
             raise ValueError("joint frontier interval durations must align")
         if duration <= 0.0:
@@ -272,7 +266,5 @@ def clairvoyant_report(
         "low_battery_bound_run_seconds": low_bound,
         "efficiency": efficiency,
         "gap_seconds": gap,
-        "hot_only_hindsight_threshold_c": (
-            None if marginal is None else hot_ref_c + marginal
-        ),
+        "hot_only_hindsight_threshold_c": (None if marginal is None else hot_ref_c + marginal),
     }

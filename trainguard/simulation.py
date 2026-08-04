@@ -45,9 +45,7 @@ def _timestamp(value: Any, context: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError as exc:
-        raise TraceError(
-            f"{context}: observed_at must be an RFC 3339 timestamp"
-        ) from exc
+        raise TraceError(f"{context}: observed_at must be an RFC 3339 timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise TraceError(f"{context}: observed_at must include a UTC offset")
     return parsed.astimezone(timezone.utc)
@@ -67,9 +65,7 @@ def _optional_number(
         raise TraceError(f"{context}: {name} must be a number or null")
     number = float(value)
     if not math.isfinite(number) or not minimum <= number <= maximum:
-        raise TraceError(
-            f"{context}: {name} must be between {minimum:g} and {maximum:g}"
-        )
+        raise TraceError(f"{context}: {name} must be between {minimum:g} and {maximum:g}")
     return number
 
 
@@ -109,13 +105,9 @@ def observation_from_mapping(value: Mapping[str, Any], context: str) -> Observat
         raise TraceError(f"{context}: charging must be true, false or null")
 
     warnings = value.get("warnings", [])
-    if not isinstance(warnings, list) or any(
-        not isinstance(item, str) for item in warnings
-    ):
+    if not isinstance(warnings, list) or any(not isinstance(item, str) for item in warnings):
         raise TraceError(f"{context}: warnings must be a list of strings")
-    if source is PowerSource.NO_BATTERY and (
-        percent is not None or charging is not None
-    ):
+    if source is PowerSource.NO_BATTERY and (percent is not None or charging is not None):
         raise TraceError(f"{context}: no_battery observations cannot have charge data")
 
     return Observation(
@@ -267,9 +259,7 @@ def simulate_policy(
 
     elapsed = (timestamps[-1] - timestamps[0]).total_seconds()
     action_percent = {
-        action.value: (
-            100.0 * action_seconds[action.value] / elapsed if elapsed > 0 else None
-        )
+        action.value: (100.0 * action_seconds[action.value] / elapsed if elapsed > 0 else None)
         for action in Action
     }
     return {
@@ -283,9 +273,7 @@ def simulate_policy(
         "started_at": observations[0].observed_at,
         "ended_at": observations[-1].observed_at,
         "elapsed_seconds": elapsed,
-        "action_samples": {
-            action.value: action_samples[action.value] for action in Action
-        },
+        "action_samples": {action.value: action_samples[action.value] for action in Action},
         "action_seconds": action_seconds,
         "action_percent": action_percent,
         "reason_samples": dict(sorted(reason_samples.items())),
@@ -358,12 +346,10 @@ def compare_policies(
                 for action in Action
             },
             "action_transitions": (
-                int(candidate["action_transitions"])
-                - int(baseline["action_transitions"])
+                int(candidate["action_transitions"]) - int(baseline["action_transitions"])
             ),
             "decision_transitions": (
-                int(candidate["decision_transitions"])
-                - int(baseline["decision_transitions"])
+                int(candidate["decision_transitions"]) - int(baseline["decision_transitions"])
             ),
             "action_disagreement_samples": action_disagreement_samples,
             "action_disagreement_seconds": action_disagreement_seconds,

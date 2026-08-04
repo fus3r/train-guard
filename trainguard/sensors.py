@@ -60,7 +60,9 @@ def battery_temperature_c(system: Optional[str] = None) -> Optional[float]:
             return float(match.group(1)) / 100.0 if match else None
 
         if system == "Linux":
-            temps = getattr(psutil, "sensors_temperatures", lambda: {})() or {}
+            temps: dict[str, list[Any]] = (
+                getattr(psutil, "sensors_temperatures", lambda: {})() or {}
+            )
             for name, entries in temps.items():
                 if "bat" not in name.lower():
                     continue

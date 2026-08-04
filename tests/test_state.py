@@ -47,9 +47,7 @@ def _runtime(**overrides):
 )
 def test_unsafe_names_and_blank_patterns_fail_before_spawn(argv, monkeypatch, capsys):
     spawned = []
-    monkeypatch.setattr(
-        cli, "_spawn_detached", lambda *args, **kwargs: spawned.append(args)
-    )
+    monkeypatch.setattr(cli, "_spawn_detached", lambda *args, **kwargs: spawned.append(args))
 
     assert cli.main(argv) == 2
     assert spawned == []
@@ -57,9 +55,7 @@ def test_unsafe_names_and_blank_patterns_fail_before_spawn(argv, monkeypatch, ca
     assert validate_job_name("model.v2-run") == "model.v2-run"
 
 
-def test_state_home_is_absolute_and_exported_for_detached_children(
-    tmp_path, monkeypatch
-):
+def test_state_home_is_absolute_and_exported_for_detached_children(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TRAIN_GUARD_HOME", "relative-state")
 
@@ -205,9 +201,7 @@ def test_orphan_runtime_is_reported_and_blocks_spawn(app_paths, monkeypatch, cap
     assert "recovery state has no job metadata" in capsys.readouterr().out
 
     spawned = []
-    monkeypatch.setattr(
-        cli, "_spawn_detached", lambda *args, **kwargs: spawned.append(args)
-    )
+    monkeypatch.setattr(cli, "_spawn_detached", lambda *args, **kwargs: spawned.append(args))
     assert cli.main(["run", "--name", "orphan", "--", "python", "train.py"]) == 2
     assert spawned == []
     assert store.runtime_path("orphan").exists()
@@ -242,9 +236,7 @@ def test_job_name_lock_serializes_creation_before_spawn_and_is_reusable(
     assert holder.stdout is not None
     assert holder.stdout.readline().strip() == "acquired"
     spawned = []
-    monkeypatch.setattr(
-        cli, "_spawn_detached", lambda *args, **kwargs: spawned.append(args)
-    )
+    monkeypatch.setattr(cli, "_spawn_detached", lambda *args, **kwargs: spawned.append(args))
     try:
         assert cli.main(["run", "--name", "training", "--", "python", "train.py"]) == 2
     finally:

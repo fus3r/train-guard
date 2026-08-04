@@ -74,9 +74,7 @@ def _exact_joint_lp(
     best = Fraction(0)
 
     def feasible_objective(values: list[Fraction]) -> Optional[Fraction]:
-        if any(
-            value < 0 or value > items[index][2] for index, value in enumerate(values)
-        ):
+        if any(value < 0 or value > items[index][2] for index, value in enumerate(values)):
             return None
         hot = sum(items[index][0] * value for index, value in enumerate(values))
         low = sum(items[index][1] * value for index, value in enumerate(values))
@@ -116,18 +114,15 @@ def _exact_joint_lp(
                     hot_remaining = hot_budget - used_hot
                     low_remaining = low_budget - used_low
                     determinant = (
-                        items[first][0] * items[second][1]
-                        - items[second][0] * items[first][1]
+                        items[first][0] * items[second][1] - items[second][0] * items[first][1]
                     )
                     if determinant:
                         candidate = list(values)
                         candidate[first] = (
-                            hot_remaining * items[second][1]
-                            - items[second][0] * low_remaining
+                            hot_remaining * items[second][1] - items[second][0] * low_remaining
                         ) / determinant
                         candidate[second] = (
-                            items[first][0] * low_remaining
-                            - hot_remaining * items[first][1]
+                            items[first][0] * low_remaining - hot_remaining * items[first][1]
                         ) / determinant
                         candidates.append(candidate)
 

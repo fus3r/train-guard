@@ -86,18 +86,14 @@ def parse_grid(text: str, source: str = "grid") -> SweepGrid:
             f"{source}: invalid JSON at line {exc.lineno}, column {exc.colno}"
         ) from exc
     if not isinstance(raw, dict) or not raw:
-        raise SweepError(
-            f"{source}: the grid must be a non-empty object, e.g. {_GRID_EXAMPLE}"
-        )
+        raise SweepError(f"{source}: the grid must be a non-empty object, e.g. {_GRID_EXAMPLE}")
 
     valid_fields = set(PolicyConfig().to_dict())
     axes: list[tuple[str, list[Any]]] = []
     for name in sorted(raw):
         if name not in valid_fields:
             known = ", ".join(sorted(valid_fields))
-            raise SweepError(
-                f"{source}: unknown policy field '{name}' (known fields: {known})"
-            )
+            raise SweepError(f"{source}: unknown policy field '{name}' (known fields: {known})")
         values = raw[name]
         if not isinstance(values, list) or not values:
             raise SweepError(f"{source}: {name} must map to a non-empty list of values")
@@ -186,9 +182,7 @@ def _python_rows(
             if action is not Action.STOP:
                 run_seconds += duration
                 if observation.temperature_c is not None:
-                    hot_degc_seconds += (
-                        max(0.0, observation.temperature_c - hot_ref_c) * duration
-                    )
+                    hot_degc_seconds += max(0.0, observation.temperature_c - hot_ref_c) * duration
                 if (
                     observation.source is PowerSource.BATTERY
                     and observation.percent is not None
@@ -257,9 +251,7 @@ def trace_facts(
         "elapsed_seconds": elapsed,
         "hot_reference_c": hot_ref_c,
         "hot_degc_seconds": hot_degc_seconds,
-        "temperature_coverage": (
-            temperature_seconds / elapsed if elapsed > 0 else None
-        ),
+        "temperature_coverage": (temperature_seconds / elapsed if elapsed > 0 else None),
         "high_soc_reference_pct": high_soc_ref_pct,
         "high_soc_seconds": high_soc_seconds,
         "hot_and_full_seconds": hot_and_full_seconds,
@@ -340,15 +332,11 @@ def _candidate_report(
         },
         "delta_vs_baseline": {
             "run_seconds": row.run_seconds - baseline_row.run_seconds,
-            "hot_run_degc_seconds": (
-                row.hot_degc_seconds - baseline_row.hot_degc_seconds
-            ),
+            "hot_run_degc_seconds": (row.hot_degc_seconds - baseline_row.hot_degc_seconds),
             "low_battery_run_seconds": (
                 row.low_battery_run_seconds - baseline_row.low_battery_run_seconds
             ),
-            "action_transitions": (
-                row.action_transitions - baseline_row.action_transitions
-            ),
+            "action_transitions": (row.action_transitions - baseline_row.action_transitions),
         },
     }
 
@@ -367,15 +355,10 @@ def run_sweep(
     if engine not in {"auto", "python", "native"}:
         raise SweepError("engine must be auto, python or native")
     if engine == "native":
-        raise SweepError(
-            "engine=native is not available in this build; use auto or python"
-        )
+        raise SweepError("engine=native is not available in this build; use auto or python")
     if not math.isfinite(float(hot_ref_c)) or not -100 <= hot_ref_c <= 200:
         raise SweepError("hot reference must be between -100 and 200")
-    if (
-        not math.isfinite(float(low_battery_ref_pct))
-        or not 0 <= low_battery_ref_pct <= 100
-    ):
+    if not math.isfinite(float(low_battery_ref_pct)) or not 0 <= low_battery_ref_pct <= 100:
         raise SweepError("low-battery reference must be between 0 and 100")
     if not observations:
         raise TraceError("cannot sweep an empty trace")
@@ -400,9 +383,7 @@ def run_sweep(
     elapsed = (timestamps[-1] - timestamps[0]).total_seconds()
 
     hot_rated = hot_rated_intervals(observations, durations, hot_ref_c)
-    low_rated = low_battery_rated_intervals(
-        observations, durations, low_battery_ref_pct
-    )
+    low_rated = low_battery_rated_intervals(observations, durations, low_battery_ref_pct)
     hot_frontier = build_frontier(hot_rated)
     low_frontier = build_frontier(low_rated)
     joint_frontier = build_joint_frontier(hot_rated, low_rated)

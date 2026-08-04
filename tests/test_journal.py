@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
-from trainguard import cli, journal as journal_module
+from trainguard import cli
+from trainguard import journal as journal_module
 from trainguard import supervisor as supervisor_module
 from trainguard.journal import EventJournal
 from trainguard.model import Observation, PowerSource, ProcessIdentity

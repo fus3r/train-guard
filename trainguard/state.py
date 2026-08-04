@@ -36,9 +36,7 @@ def validate_job_name(name: str) -> str:
     """Return a safe state-file stem or reject it before any process starts."""
 
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name) or name in {".", ".."}:
-        raise StateError(
-            "job names must be 1-64 characters using letters, digits, '.', '_' or '-'"
-        )
+        raise StateError("job names must be 1-64 characters using letters, digits, '.', '_' or '-'")
     if name.split(".", 1)[0].lower() in _RESERVED_NAMES:
         raise StateError(f"job name '{name}' is a reserved Windows device name")
     return name
@@ -164,9 +162,7 @@ class JobNameLock:
         except OSError as exc:
             handle.close()
             if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-                raise StateError(
-                    f"another command is already creating job '{self.name}'"
-                ) from exc
+                raise StateError(f"another command is already creating job '{self.name}'") from exc
             raise
         self._handle = handle
         return self
@@ -262,9 +258,7 @@ class JobSpec:
             or not isinstance(schema_version, int)
             or schema_version != 1
         ):
-            raise StateError(
-                f"unsupported job metadata schema version: {schema_version!r}"
-            )
+            raise StateError(f"unsupported job metadata schema version: {schema_version!r}")
         try:
             raw_name = value["name"]
             raw_mode = value["mode"]
@@ -354,9 +348,7 @@ class PersistenceSpec:
             or not isinstance(schema_version, int)
             or schema_version != 1
         ):
-            raise StateError(
-                f"unsupported persistence schema version: {schema_version!r}"
-            )
+            raise StateError(f"unsupported persistence schema version: {schema_version!r}")
         try:
             mode = value["mode"]
             raw_name = value["name"]
@@ -404,9 +396,7 @@ def _validate_runtime_state(path: Path, value: Any) -> dict[str, Any]:
         or not isinstance(schema_version, int)
         or schema_version != 1
     ):
-        raise StateError(
-            f"{path}: unsupported runtime schema version: {schema_version!r}"
-        )
+        raise StateError(f"{path}: unsupported runtime schema version: {schema_version!r}")
     if not isinstance(value.get("updated_at"), str) or not value["updated_at"]:
         raise StateError(f"{path}: runtime updated_at must be a non-empty string")
     if not isinstance(value.get("state"), str) or not value["state"]:
@@ -425,9 +415,7 @@ def _validate_runtime_state(path: Path, value: Any) -> dict[str, Any]:
             try:
                 ProcessIdentity.from_dict(record)
             except ValueError as exc:
-                raise StateError(
-                    f"{context} has an invalid process identity: {exc}"
-                ) from exc
+                raise StateError(f"{context} has an invalid process identity: {exc}") from exc
             if field_name == "tuned_processes":
                 system = record.get("system")
                 if not isinstance(system, str) or not system:
@@ -440,9 +428,7 @@ def _validate_runtime_state(path: Path, value: Any) -> dict[str, Any]:
                         for cpu in affinity
                     )
                 ):
-                    raise StateError(
-                        f"{context} affinity must be a list of non-negative integers"
-                    )
+                    raise StateError(f"{context} affinity must be a list of non-negative integers")
                 ionice_class = record.get("ionice_class")
                 ionice_value = record.get("ionice_value")
                 if (ionice_class is None) != (ionice_value is None):
@@ -452,8 +438,7 @@ def _validate_runtime_state(path: Path, value: Any) -> dict[str, Any]:
                 for integer_name in ("ionice_class", "ionice_value", "priority"):
                     integer_value = record.get(integer_name)
                     if integer_value is not None and (
-                        isinstance(integer_value, bool)
-                        or not isinstance(integer_value, int)
+                        isinstance(integer_value, bool) or not isinstance(integer_value, int)
                     ):
                         raise StateError(f"{context} {integer_name} must be an integer")
 
@@ -468,9 +453,7 @@ def _validate_runtime_state(path: Path, value: Any) -> dict[str, Any]:
             raise StateError(f"{path}: runtime {field_name} must be an object")
     for field_name in ("config_error", "error"):
         field_value = value.get(field_name)
-        if field_value is not None and (
-            not isinstance(field_value, str) or not field_value
-        ):
+        if field_value is not None and (not isinstance(field_value, str) or not field_value):
             raise StateError(f"{path}: runtime {field_name} must be a non-empty string")
     return value
 
@@ -533,9 +516,7 @@ class JobStore:
         try:
             return ProcessIdentity.from_dict(value)
         except ValueError as exc:
-            raise StateError(
-                f"{self.guard_path(name)}: invalid process identity: {exc}"
-            ) from exc
+            raise StateError(f"{self.guard_path(name)}: invalid process identity: {exc}") from exc
 
     def write_runtime(self, name: str, value: dict[str, Any]) -> None:
         path = self.runtime_path(name)
@@ -672,8 +653,7 @@ class JobStore:
 
         errors: list[str] = []
         metadata_names = {
-            path.name[: -len(".meta.json")]
-            for path in self.paths.run.glob("*.meta.json")
+            path.name[: -len(".meta.json")] for path in self.paths.run.glob("*.meta.json")
         }
         for path in sorted(self.paths.run.glob("*.meta.json")):
             name = path.name[: -len(".meta.json")]

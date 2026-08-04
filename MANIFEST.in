@@ -1,0 +1,4 @@
+include config.example.json
+recursive-include examples *.json *.jsonl
+recursive-include macos *.env *.md *.sh
+recursive-include tests *.py

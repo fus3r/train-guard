@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, Callable, Optional, Sequence, Union, cast
 
 try:
     import psutil
@@ -56,6 +57,8 @@ if __package__:
     )
     from .supervisor import (
         _migrate_legacy_identity as _migrate_legacy_identity_impl,
+    )
+    from .supervisor import (
         _runtime_payload,
         run_supervisor,
     )
@@ -90,6 +93,8 @@ else:  # Keep direct execution from a checkout working.
     )
     from supervisor import (
         _migrate_legacy_identity as _migrate_legacy_identity_impl,
+    )
+    from supervisor import (
         _runtime_payload,
         run_supervisor,
     )
@@ -101,7 +106,7 @@ else:  # Keep direct execution from a checkout working.
         run_sweep,
     )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 _SUPERVISOR_START_TIMEOUT_SECONDS = 5.0
 SYSTEM = platform.system()  # 'Darwin' | 'Linux' | 'Windows'
 HOME = Path.home()
@@ -140,7 +145,7 @@ def _ensure_dirs() -> None:
     _paths()
 
 
-def _json_dump(value) -> None:
+def _json_dump(value: Any) -> None:
     json.dump(value, sys.stdout, indent=2, sort_keys=True, allow_nan=False)
     sys.stdout.write("\n")
 
@@ -149,7 +154,7 @@ def load_config() -> PolicyConfig:
     return load_policy(_paths().config)
 
 
-def _migrate_legacy_identity(store, spec):
+def _migrate_legacy_identity(store: JobStore, spec: JobSpec) -> JobSpec:
     """Compatibility wrapper for callers of the pre-Supervisor helper."""
 
     return _migrate_legacy_identity_impl(store, spec)
@@ -164,7 +169,7 @@ _SOURCE_LABELS = {
 
 
 # Process lookup.
-def _pattern_running(pat):
+def _pattern_running(pat: str) -> bool:
     for p in psutil.process_iter(["cmdline"]):
         try:
             if pat in " ".join(p.info["cmdline"] or []) and not is_guard_process(p):
@@ -175,18 +180,18 @@ def _pattern_running(pat):
 
 
 # Filesystem helpers.
-def _read_pid(path):
+def _read_pid(path: Union[str, Path]) -> Optional[int]:
     try:
         return int(Path(path).read_text().strip())
     except Exception:
         return None
 
 
-def _alive(pid):
+def _alive(pid: Optional[int]) -> bool:
     return pid is not None and psutil.pid_exists(pid)
 
 
-def _capture_identity(pid, label):
+def _capture_identity(pid: int, label: str) -> ProcessIdentity:
     try:
         process = psutil.Process(pid)
         return process_identity(process)
@@ -196,7 +201,7 @@ def _capture_identity(pid, label):
         raise StateError(f"cannot inspect {label} process {pid}") from exc
 
 
-def _guard_status(store, name):
+def _guard_status(store: JobStore, name: str) -> tuple[Optional[int], bool]:
     identity = store.read_guard(name)
     if identity is not None:
         return identity.pid, identity_is_alive(identity)
@@ -204,7 +209,7 @@ def _guard_status(store, name):
     return pid, _alive(pid)
 
 
-def _ensure_name_available(store, name):
+def _ensure_name_available(store: JobStore, name: str) -> None:
     validate_job_name(name)
     if store.spec_path(name).exists():
         _guard_pid, guard_alive = _guard_status(store, name)
@@ -230,23 +235,31 @@ def _ensure_name_available(store, name):
     store.clear_stop(name)
 
 
-def _spawn_detached(args, logfile=None, cwd=None):
-    out = open(logfile, "ab") if logfile else subprocess.DEVNULL
-    kw = dict(stdin=subprocess.DEVNULL, stdout=out, stderr=out, cwd=cwd)
+def _spawn_detached(
+    args: Sequence[str],
+    logfile: Optional[Path] = None,
+    cwd: Optional[Union[str, Path]] = None,
+) -> subprocess.Popen[bytes]:
+    output = open(logfile, "ab") if logfile else None
+    stream: Any = output if output is not None else subprocess.DEVNULL
+    kw: dict[str, Any] = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=stream,
+        stderr=stream,
+        cwd=cwd,
+    )
     if os.name == "nt":
-        kw["creationflags"] = (
-            0x00000008 | 0x00000200
-        )  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         kw["start_new_session"] = True
     try:
-        return subprocess.Popen(args, **kw)
+        return subprocess.Popen(list(args), **kw)
     finally:
-        if logfile:
-            out.close()
+        if output is not None:
+            output.close()
 
 
-def _terminate_spawned(process):
+def _terminate_spawned(process: subprocess.Popen[Any]) -> None:
     """Best-effort rollback for a child created by the current command."""
 
     try:
@@ -266,7 +279,10 @@ def _terminate_spawned(process):
             pass
 
 
-def _supervisor_argv(name, excluded_identity=None):
+def _supervisor_argv(
+    name: str,
+    excluded_identity: Optional[ProcessIdentity] = None,
+) -> list[str]:
     argv = [sys.executable, str(Path(__file__).resolve()), "__supervise", name]
     if excluded_identity is not None:
         argv.extend(
@@ -278,7 +294,10 @@ def _supervisor_argv(name, excluded_identity=None):
     return argv
 
 
-def _supervisor_exited(supervisor, expected):
+def _supervisor_exited(
+    supervisor: Optional[Any],
+    expected: ProcessIdentity,
+) -> bool:
     # A dead child remains a zombie until reaped, and its identity still
     # matches. The Popen handle is therefore authoritative when available.
     if supervisor is not None:
@@ -289,23 +308,21 @@ def _supervisor_exited(supervisor, expected):
 
 
 def _wait_for_supervisor_ready(
-    store,
-    name,
-    expected,
+    store: JobStore,
+    name: str,
+    expected: ProcessIdentity,
     *,
-    supervisor=None,
-    timeout=_SUPERVISOR_START_TIMEOUT_SECONDS,
-):
+    supervisor: Optional[Any] = None,
+    timeout: float = _SUPERVISOR_START_TIMEOUT_SECONDS,
+) -> None:
     """Wait for the child-written handshake before reporting success."""
 
-    def consume_ready():
+    def consume_ready() -> bool:
         ready = store.read_ready(name)
         if ready is None:
             return False
         if ready != expected:
-            raise StateError(
-                f"supervisor identity changed while starting guard '{name}'"
-            )
+            raise StateError(f"supervisor identity changed while starting guard '{name}'")
         # Reap a short-lived child if it has already exited.
         if supervisor is not None and hasattr(supervisor, "poll"):
             supervisor.poll()
@@ -320,8 +337,7 @@ def _wait_for_supervisor_ready(
         if exited:
             log_path = store.paths.logs / f"{name}.guard.log"
             raise StateError(
-                f"supervisor for guard '{name}' exited before it reported "
-                f"ready; inspect {log_path}"
+                f"supervisor for guard '{name}' exited before it reported ready; inspect {log_path}"
             )
         exited = _supervisor_exited(supervisor, expected)
         # The child writes readiness before a clean immediate exit. Read it
@@ -336,7 +352,11 @@ def _wait_for_supervisor_ready(
     )
 
 
-def _start_supervisor(store, name, excluded_identity=None):
+def _start_supervisor(
+    store: JobStore,
+    name: str,
+    excluded_identity: Optional[ProcessIdentity] = None,
+) -> ProcessIdentity:
     store.clear_ready(name)
     supervisor = _spawn_detached(
         _supervisor_argv(name, excluded_identity),
@@ -364,12 +384,15 @@ def _start_supervisor(store, name, excluded_identity=None):
         raise
 
 
-def cmd_supervise(name, excluded_identity=None):
+def cmd_supervise(
+    name: str,
+    excluded_identity: Optional[ProcessIdentity] = None,
+) -> int:
     return run_supervisor(_paths(), name, excluded_identity)
 
 
 # CLI commands.
-def _policy_line(cfg: PolicyConfig):
+def _policy_line(cfg: PolicyConfig) -> str:
     batt = (
         "pause"
         if not cfg.run_on_battery
@@ -378,19 +401,23 @@ def _policy_line(cfg: PolicyConfig):
     return f"AC={cfg.ac_band}  battery={batt}"
 
 
-def _restart_on_login(args):
+def _restart_on_login(args: argparse.Namespace) -> bool:
     """Read the new flag while accepting programmatic v0.1 callers."""
     return bool(getattr(args, "restart_on_login", getattr(args, "persist", False)))
 
 
-def _working_directory(value):
+def _working_directory(value: Optional[str]) -> str:
     path = Path(value or os.getcwd()).expanduser()
     if not path.is_dir():
         raise StateError(f"working directory does not exist: {path}")
     return str(path.resolve())
 
 
-def _previous_persistence(store, name, restart):
+def _previous_persistence(
+    store: JobStore,
+    name: str,
+    restart: bool,
+) -> tuple[Optional[PersistenceSpec], bool]:
     if not restart:
         return None, False
     path = store.persistence_path(name)
@@ -399,14 +426,20 @@ def _previous_persistence(store, name, restart):
     return store.read_persistence(path), True
 
 
-def _rollback_persistence(store, name, previous, existed):
+def _rollback_persistence(
+    store: JobStore,
+    name: str,
+    previous: Optional[PersistenceSpec],
+    existed: bool,
+) -> None:
     if existed:
+        assert previous is not None
         store.write_persistence(previous)
     else:
         store.remove_persistence(name)
 
 
-def cmd_run(args):
+def cmd_run(args: argparse.Namespace) -> int:
     paths = _paths()
     store = JobStore(paths)
     cfg = load_policy(paths.config)
@@ -457,27 +490,26 @@ def cmd_run(args):
                 )
             raise
     tag = "  (restarts at next login)" if restart else ""
-    print(
-        f"[train-guard] '{name}': job pid={job.pid}  "
-        f"guard pid={guard.pid}  out={log}{tag}"
-    )
+    print(f"[train-guard] '{name}': job pid={job.pid}  guard pid={guard.pid}  out={log}{tag}")
     print(f"[train-guard] policy: {_policy_line(cfg)}   |   train-guard status")
     return 0
 
 
-def cmd_attach(args):
+def cmd_attach(args: argparse.Namespace) -> int:
     paths = _paths()
     store = JobStore(paths)
     cfg = load_policy(paths.config)
     if not args.match and not args.pid:
         sys.stderr.write(
-            'usage: train-guard attach --match "<pattern>" [--name N] [--restart-on-login --start "<cmd>"]   (or --pid PID)\n'
+            'usage: train-guard attach --match "<pattern>" [--name N] '
+            '[--restart-on-login --start "<cmd>"]   (or --pid PID)\n'
         )
         return 2
     restart = _restart_on_login(args)
     if args.pid and restart:
         sys.stderr.write(
-            "attach: a PID cannot survive a reboot; use --match with --restart-on-login and optionally --start\n"
+            "attach: a PID cannot survive a reboot; use --match with "
+            "--restart-on-login and optionally --start\n"
         )
         return 2
     name = validate_job_name(args.name or f"attach-{time.strftime('%H%M%S')}")
@@ -528,12 +560,12 @@ def cmd_attach(args):
     return 0
 
 
-def _agent_installed():
+def _agent_installed() -> bool:
     return agent_installed(AppPaths.from_environment(), SYSTEM)
 
 
-def _guard_payloads(store):
-    guards = []
+def _guard_payloads(store: JobStore) -> tuple[list[dict[str, Any]], list[str]]:
+    guards: list[dict[str, Any]] = []
     state_errors = store.audit_state()
     for spec in store.list_specs():
         guard_error = None
@@ -554,12 +586,10 @@ def _guard_payloads(store):
             if runtime_error not in state_errors:
                 state_errors.append(runtime_error)
 
-        guard = {
+        guard: dict[str, Any] = {
             "alive": guard_alive,
             "pid": guard_pid,
-            "identity_verified": (
-                guard_error is None and store.guard_path(spec.name).exists()
-            ),
+            "identity_verified": (guard_error is None and store.guard_path(spec.name).exists()),
         }
         if guard_error:
             guard["error"] = guard_error
@@ -575,7 +605,7 @@ def _guard_payloads(store):
     return guards, state_errors
 
 
-def _status_payload(paths):
+def _status_payload(paths: AppPaths) -> dict[str, Any]:
     store = JobStore(paths)
     config_error = None
     try:
@@ -606,7 +636,7 @@ def _status_payload(paths):
     }
 
 
-def cmd_status(args):
+def cmd_status(args: argparse.Namespace) -> int:
     paths = _paths()
     payload = _status_payload(paths)
     if getattr(args, "json", False):
@@ -680,9 +710,7 @@ def cmd_status(args):
         for error in payload["state_errors"]:
             print(f"  ! {error}")
     print()
-    print(
-        "restart after reboot (starts a new process; RAM state cannot survive a reboot)"
-    )
+    print("restart after reboot (starts a new process; RAM state cannot survive a reboot)")
     print(
         "  login agent: "
         + (
@@ -705,7 +733,7 @@ def cmd_status(args):
     return 1 if payload["policy_error"] or payload["state_errors"] else 0
 
 
-def cmd_list(args):
+def cmd_list(args: argparse.Namespace) -> int:
     store = JobStore(_paths())
     guards, state_errors = _guard_payloads(store)
     if getattr(args, "json", False):
@@ -721,17 +749,13 @@ def cmd_list(args):
             ]
         )
     else:
-        print(
-            "\n".join(item["name"] for item in guards)
-            if guards
-            else "(no active guards)"
-        )
+        print("\n".join(item["name"] for item in guards) if guards else "(no active guards)")
     for error in state_errors:
         print(f"state error: {error}", file=sys.stderr)
     return 1 if state_errors else 0
 
 
-def cmd_stop(args):
+def cmd_stop(args: argparse.Namespace) -> int:
     store = JobStore(_paths())
     name = validate_job_name(args.name)
     if not store.spec_path(name).exists():
@@ -755,19 +779,19 @@ def cmd_stop(args):
     return 0
 
 
-def _runtime_identities(runtime):
+def _runtime_identities(runtime: Optional[dict[str, Any]]) -> list[ProcessIdentity]:
     if runtime is None:
         return []
     return [ProcessIdentity.from_dict(value) for value in runtime["owned_suspensions"]]
 
 
-def _runtime_tuning(runtime):
+def _runtime_tuning(runtime: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
     if runtime is None:
         return []
     return list(runtime["tuned_processes"])
 
 
-def _apply_report_dict(report):
+def _apply_report_dict(report: Any) -> dict[str, Any]:
     return {
         field: getattr(report, field)
         for field in (
@@ -782,7 +806,7 @@ def _apply_report_dict(report):
     }
 
 
-def cmd_recover(args):
+def cmd_recover(args: argparse.Namespace) -> int:
     paths = _paths()
     store = JobStore(paths)
     name = validate_job_name(args.name)
@@ -834,7 +858,7 @@ def cmd_recover(args):
     return 1 if report.access_denied else 0
 
 
-def cmd_events(args):
+def cmd_events(args: argparse.Namespace) -> int:
     if args.limit < 1:
         raise StateError("--limit must be at least 1")
     events = EventJournal(_paths(), args.name).read(args.limit)
@@ -852,7 +876,7 @@ def cmd_events(args):
     return 0
 
 
-def cmd_simulate(args):
+def cmd_simulate(args: argparse.Namespace) -> int:
     if args.transition_limit < 1:
         raise StateError("--transition-limit must be at least 1")
     trace_path = Path(args.trace).expanduser().resolve()
@@ -869,9 +893,7 @@ def cmd_simulate(args):
     if args.compare_config_path:
         candidate_path = Path(args.compare_config_path).expanduser().resolve()
         if not candidate_path.is_file():
-            raise StateError(
-                f"comparison configuration file does not exist: {candidate_path}"
-            )
+            raise StateError(f"comparison configuration file does not exist: {candidate_path}")
         candidate = load_policy(candidate_path)
         comparison = compare_policies(policy, candidate, observations)
         comparison["trace"] = str(trace_path)
@@ -930,8 +952,7 @@ def cmd_simulate(args):
         return 0
 
     print(
-        f"trace: {trace_path}  samples={report['samples']}  "
-        f"elapsed={report['elapsed_seconds']:g}s"
+        f"trace: {trace_path}  samples={report['samples']}  elapsed={report['elapsed_seconds']:g}s"
     )
     print(f"policy: {_policy_line(policy)}")
     print("actions")
@@ -960,7 +981,7 @@ def cmd_simulate(args):
     return 0
 
 
-def cmd_sweep(args):
+def cmd_sweep(args: argparse.Namespace) -> int:
     if args.top < 1:
         raise StateError("--top must be at least 1")
     trace_path = Path(args.trace).expanduser().resolve()
@@ -1003,7 +1024,7 @@ def cmd_sweep(args):
         f"elapsed={report['elapsed_seconds']:g}s  engine={report['engine']}"
     )
 
-    def coverage(value):
+    def coverage(value: Optional[float]) -> str:
         return "n/a" if value is None else f"{100 * value:.0f}%"
 
     print(
@@ -1027,7 +1048,7 @@ def cmd_sweep(args):
         f"transitions {baseline['action_transitions']}"
     )
 
-    def efficiency_text(value):
+    def efficiency_text(value: Optional[float]) -> str:
         return "n/a" if value is None else f"{100 * value:.0f}%"
 
     bound = report["baseline"]["clairvoyant"]
@@ -1054,9 +1075,7 @@ def cmd_sweep(args):
     remaining = len(report["candidates"]) - args.top
     if remaining > 0:
         print(f"  ... {remaining} more; use --json for the complete report")
-    print(
-        "* pareto-optimal on (run seconds up, hot exposure down, low-battery run down)"
-    )
+    print("* pareto-optimal on (run seconds up, hot exposure down, low-battery run down)")
     print(
         "note: metrics re-weight the recorded trace under each policy's "
         "actions; they do not simulate temperature or charge and are not "
@@ -1067,13 +1086,11 @@ def cmd_sweep(args):
     return 0
 
 
-def cmd_config(args):
+def cmd_config(args: argparse.Namespace) -> int:
     paths = _paths()
     if getattr(args, "init", False):
         if paths.config.exists() and not getattr(args, "force", False):
-            raise StateError(
-                f"{paths.config} already exists; pass --force to replace it"
-            )
+            raise StateError(f"{paths.config} already exists; pass --force to replace it")
         atomic_json_write(paths.config, PolicyConfig().to_dict())
         print(f"wrote {paths.config}")
     cfg = load_policy(paths.config)
@@ -1087,7 +1104,7 @@ def cmd_config(args):
     return 0
 
 
-def _doctor_payload(paths):
+def _doctor_payload(paths: AppPaths) -> dict[str, Any]:
     checks = []
     try:
         policy = load_policy(paths.config)
@@ -1162,14 +1179,13 @@ def _doctor_payload(paths):
     }
 
 
-def cmd_doctor(args):
+def cmd_doctor(args: argparse.Namespace) -> int:
     payload = _doctor_payload(_paths())
     if args.json:
         _json_dump(payload)
     else:
         print(
-            f"train-guard {payload['version']}  Python {payload['python']}  "
-            f"{payload['platform']}"
+            f"train-guard {payload['version']}  Python {payload['python']}  {payload['platform']}"
         )
         for check in payload["checks"]:
             label = "ok" if check["ok"] else "FAIL"
@@ -1182,7 +1198,7 @@ def cmd_doctor(args):
     return 0 if payload["ok"] else 1
 
 
-def cmd_restart_persisted(args):
+def cmd_restart_persisted(_args: argparse.Namespace) -> int:
     """Recreate configured jobs after login.
 
     This deliberately does not claim process-state restoration: an OS reboot
@@ -1201,10 +1217,7 @@ def cmd_restart_persisted(args):
                 if _guard_status(store, name)[1]:
                     print(f"[restart] '{name}' already active; skipping")
                 else:
-                    print(
-                        f"[restart] '{name}' has stale state; "
-                        "run recover before restarting"
-                    )
+                    print(f"[restart] '{name}' has stale state; run recover before restarting")
                     failures += 1
                 continue
             if spec.mode == "run":
@@ -1219,13 +1232,10 @@ def cmd_restart_persisted(args):
                 )
             else:
                 pattern, start = spec.pattern, spec.start or ""
+                assert pattern is not None
                 started_process = None
                 if start and not _pattern_running(pattern):
-                    shell = (
-                        ["cmd", "/c", start]
-                        if os.name == "nt"
-                        else ["/bin/sh", "-c", start]
-                    )
+                    shell = ["cmd", "/c", start] if os.name == "nt" else ["/bin/sh", "-c", start]
                     started_process = _spawn_detached(
                         shell,
                         logfile=paths.logs / f"{name}.start.log",
@@ -1252,9 +1262,7 @@ def cmd_restart_persisted(args):
         except (ConfigError, OSError, StateError) as exc:
             failures += 1
             print(f"[restart] {spec.name}: {exc}", file=sys.stderr)
-    print(
-        "[restart] done (commands were restarted or reattached; no RAM state was restored)"
-    )
+    print("[restart] done (commands were restarted or reattached; no RAM state was restored)")
     return 1 if failures else 0
 
 
@@ -1262,7 +1270,7 @@ def cmd_restart_persisted(args):
 cmd_resume = cmd_restart_persisted
 
 
-def cmd_unpersist(args):
+def cmd_unpersist(args: argparse.Namespace) -> int:
     store = JobStore(_paths())
     name = validate_job_name(args.name)
     store.remove_persistence(name)
@@ -1270,7 +1278,7 @@ def cmd_unpersist(args):
     return 0
 
 
-def cmd_install_agent(args):
+def cmd_install_agent(_args: argparse.Namespace) -> int:
     paths = _paths()
     restart_argv = [sys.executable, str(Path(__file__).resolve()), "restart-persisted"]
     target = install_agent(paths, restart_argv, SYSTEM)
@@ -1282,13 +1290,13 @@ def cmd_install_agent(args):
     return 0
 
 
-def cmd_uninstall_agent(args):
+def cmd_uninstall_agent(_args: argparse.Namespace) -> int:
     uninstall_agent(_paths(), SYSTEM)
     print("[train-guard] login agent removed.")
     return 0
 
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="train-guard",
         description="Battery and thermal supervisor for long compute jobs.",
@@ -1459,7 +1467,7 @@ def build_parser():
     return p
 
 
-def main(argv=None):
+def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
         if argv and argv[0] == "__supervise":  # internal
@@ -1479,7 +1487,8 @@ def main(argv=None):
         args = parser.parse_args(argv)
         if not getattr(args, "fn", None):
             return cmd_status(args)
-        return args.fn(args)
+        handler = cast(Callable[[argparse.Namespace], int], args.fn)
+        return handler(args)
     except (
         ConfigError,
         OSError,

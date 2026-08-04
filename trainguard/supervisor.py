@@ -32,6 +32,7 @@ else:  # Keep ``python trainguard/cli.py`` working from a checkout.
     from sensors import SensorReader
     from state import AppPaths, JobSpec, JobStore, StateError
 
+
 def _runtime_payload(
     state: str,
     cooling: bool,
@@ -48,9 +49,7 @@ def _runtime_payload(
         "updated_at": utc_now(),
         "state": state,
         "cooling": cooling,
-        "owned_suspensions": [
-            identity.to_dict() for identity in controller.owned_suspensions
-        ],
+        "owned_suspensions": [identity.to_dict() for identity in controller.owned_suspensions],
         "tuned_processes": list(controller.tuned_processes),
         "pids": sorted({int(pid) for pid in pids}),
     }
@@ -87,21 +86,17 @@ def _migrate_legacy_identity(store: JobStore, spec: JobSpec) -> JobSpec:
         identity = process_identity(psutil.Process(spec.legacy_pid))
     except (psutil.NoSuchProcess, psutil.ZombieProcess) as exc:
         raise StateError(
-            f"legacy job process {spec.legacy_pid} no longer exists; "
-            "its metadata was preserved"
+            f"legacy job process {spec.legacy_pid} no longer exists; its metadata was preserved"
         ) from exc
     except psutil.AccessDenied as exc:
         raise StateError(
-            f"cannot verify legacy job process {spec.legacy_pid}; "
-            "its metadata was preserved"
+            f"cannot verify legacy job process {spec.legacy_pid}; its metadata was preserved"
         ) from exc
 
     try:
         recorded_at = store.spec_path(spec.name).stat().st_mtime
     except OSError as exc:
-        raise StateError(
-            f"cannot date legacy metadata for guard '{spec.name}'"
-        ) from exc
+        raise StateError(f"cannot date legacy metadata for guard '{spec.name}'") from exc
     if identity.create_time > recorded_at:
         message = (
             f"STATE_MIGRATION_REFUSED pid={identity.pid}: current process "
@@ -113,8 +108,7 @@ def _migrate_legacy_identity(store: JobStore, spec: JobSpec) -> JobSpec:
             pid=identity.pid,
         )
         raise StateError(
-            f"legacy PID {identity.pid} now belongs to a newer process; "
-            "the metadata was preserved"
+            f"legacy PID {identity.pid} now belongs to a newer process; the metadata was preserved"
         )
 
     migrated = replace(spec, root=identity, legacy_pid=None)
@@ -144,9 +138,7 @@ class Supervisor:
         controller: Optional[ProcessController] = None,
     ):
         if spec.mode == "attach" and excluded_identity is None and controller is None:
-            raise StateError(
-                "cannot identify the CLI that launched this match supervisor"
-            )
+            raise StateError("cannot identify the CLI that launched this match supervisor")
 
         self.paths = paths
         self.store = JobStore(paths)
@@ -154,20 +146,15 @@ class Supervisor:
         self.journal = EventJournal(paths, spec.name)
         self.sensors = sensors or SensorReader()
         self.controller = controller or ProcessController(
-            excluded_identities=(
-                () if excluded_identity is None else (excluded_identity,)
-            )
+            excluded_identities=(() if excluded_identity is None else (excluded_identity,))
         )
         runtime = self.store.read_runtime(spec.name)
         if runtime is not None:
             self.controller.adopt_owned(
-                ProcessIdentity.from_dict(value)
-                for value in runtime["owned_suspensions"]
+                ProcessIdentity.from_dict(value) for value in runtime["owned_suspensions"]
             )
             self.controller.adopt_tuned(runtime["tuned_processes"])
-        self.policy = PolicyEngine(
-            cooling=(runtime["cooling"] if runtime is not None else False)
-        )
+        self.policy = PolicyEngine(cooling=(runtime["cooling"] if runtime is not None else False))
         self._shutdown = threading.Event()
         self._shutdown_signal: Optional[str] = None
         self._last_pids: list[int] = list(runtime["pids"]) if runtime else []
@@ -312,11 +299,7 @@ class Supervisor:
                 if self.spec.mode == "run" and not snapshot.root_alive:
                     report = self.controller.release_owned()
                     self.journal.emit(
-                        (
-                            "job_exit_cleanup_incomplete"
-                            if report.access_denied
-                            else "job_exited"
-                        ),
+                        ("job_exit_cleanup_incomplete" if report.access_denied else "job_exited"),
                         (
                             "job exited; owned process state preserved for recovery"
                             if report.access_denied
@@ -345,8 +328,7 @@ class Supervisor:
                     if self._config_error:
                         self.journal.emit(
                             "config_rejected",
-                            f"CONFIG rejected: {self._config_error}; "
-                            "keeping last valid policy",
+                            f"CONFIG rejected: {self._config_error}; keeping last valid policy",
                             error=self._config_error,
                         )
                     else:
@@ -417,8 +399,7 @@ class Supervisor:
                 (
                     f"{self._shutdown_signal or 'signal'} cleanup incomplete"
                     if report.access_denied
-                    else f"{self._shutdown_signal or 'signal'}: released owned "
-                    "process changes"
+                    else f"{self._shutdown_signal or 'signal'}: released owned process changes"
                 ),
                 signal=self._shutdown_signal,
                 process_report=_report_payload(report),
@@ -443,11 +424,7 @@ class Supervisor:
                     error=error,
                 )
                 self.journal.emit(
-                    (
-                        "crash_cleanup_incomplete"
-                        if report.access_denied
-                        else "crashed"
-                    ),
+                    ("crash_cleanup_incomplete" if report.access_denied else "crashed"),
                     (
                         f"CRASH: {error}; cleanup incomplete"
                         if report.access_denied

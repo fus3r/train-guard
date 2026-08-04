@@ -141,12 +141,8 @@ def policy_from_mapping(values: Mapping[str, Any]) -> PolicyConfig:
         temp_gentle_c=_temperature(merged["temp_gentle_c"], "temp_gentle_c"),
         temp_pause_c=_temperature(merged["temp_pause_c"], "temp_pause_c"),
         temp_resume_c=_temperature(merged["temp_resume_c"], "temp_resume_c"),
-        charge_cool_until_pct=_percentage(
-            merged["charge_cool_until_pct"], "charge_cool_until_pct"
-        ),
-        temp_charge_gentle_c=_temperature(
-            merged["temp_charge_gentle_c"], "temp_charge_gentle_c"
-        ),
+        charge_cool_until_pct=_percentage(merged["charge_cool_until_pct"], "charge_cool_until_pct"),
+        temp_charge_gentle_c=_temperature(merged["temp_charge_gentle_c"], "temp_charge_gentle_c"),
     )
 
     return config
@@ -202,9 +198,7 @@ class ConfigWatcher:
         self._fingerprint = fingerprint
         try:
             candidate = (
-                parse_policy_text(raw.decode("utf-8"), str(self.path))
-                if raw
-                else PolicyConfig()
+                parse_policy_text(raw.decode("utf-8"), str(self.path)) if raw else PolicyConfig()
             )
         except (UnicodeDecodeError, ConfigError) as exc:
             error = (

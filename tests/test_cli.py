@@ -226,19 +226,14 @@ def test_status_and_doctor_json_report_corrupt_state_without_erasing_it(
     assert "unknown configuration key" in status["policy_error"]
     assert status["guards"][0]["runtime"] is None
     assert "runtime_error" in status["guards"][0]
-    assert any(
-        "recovery state has no job metadata" in error
-        for error in status["state_errors"]
-    )
+    assert any("recovery state has no job metadata" in error for error in status["state_errors"])
     assert status["persistence_errors"]
 
     assert cli.main(["doctor", "--json"]) == 1
     doctor = json.loads(capsys.readouterr().out)
     assert doctor["schema_version"] == 1
     assert doctor["ok"] is False
-    state_check = next(
-        check for check in doctor["checks"] if check["name"] == "state_files"
-    )
+    state_check = next(check for check in doctor["checks"] if check["name"] == "state_files")
     assert state_check["ok"] is False
     assert any("orphan" in error for error in state_check["detail"]["errors"])
     assert store.runtime_path("broken").read_bytes() == before

@@ -79,9 +79,7 @@ def test_a_failing_sensor_becomes_a_warning(monkeypatch, pack_temperature):
 
 
 @pytest.mark.parametrize("percent", [float("nan"), float("inf"), -1, 101, "bad"])
-def test_an_unusable_charge_is_dropped_rather_than_guessed(
-    monkeypatch, pack_temperature, percent
-):
+def test_an_unusable_charge_is_dropped_rather_than_guessed(monkeypatch, pack_temperature, percent):
     monkeypatch.setattr(sensors.psutil, "sensors_battery", lambda: battery(percent=percent))
     pack_temperature(30.0)
 

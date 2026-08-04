@@ -270,9 +270,9 @@ def test_legacy_migration_refuses_a_process_born_after_its_metadata(
     preserved = store.read_spec("reused")
     assert preserved.root is None
     assert preserved.legacy_pid == 222
-    assert "STATE_MIGRATION_REFUSED pid=222" in (
-        app_paths.logs / "reused.guard.log"
-    ).read_text(encoding="utf-8")
+    assert "STATE_MIGRATION_REFUSED pid=222" in (app_paths.logs / "reused.guard.log").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_only_owned_suspensions_are_reasserted_serialized_and_released(

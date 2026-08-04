@@ -43,9 +43,7 @@ class MutableSensors:
 
 
 def _start_worker(seconds=30):
-    return subprocess.Popen(
-        [sys.executable, "-c", f"import time; time.sleep({seconds})"]
-    )
+    return subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
 
 
 def _wait_until(predicate, timeout=5):
@@ -105,9 +103,7 @@ def test_readiness_uses_popen_and_rechecks_after_observed_exit(
             store,
             "quick",
             expected,
-            supervisor=type(
-                "Child", (), {"poll": staticmethod(short_lived_poll)}
-            )(),
+            supervisor=type("Child", (), {"poll": staticmethod(short_lived_poll)})(),
             timeout=0.2,
         )
     assert store.read_ready("quick") is None

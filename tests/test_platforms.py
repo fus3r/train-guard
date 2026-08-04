@@ -1,7 +1,7 @@
+import plistlib
 import subprocess
 import sys
 import time
-import plistlib
 from types import SimpleNamespace
 
 import psutil

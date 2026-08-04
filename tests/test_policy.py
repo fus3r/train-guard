@@ -84,9 +84,7 @@ def test_warm_charging_rule_stops_at_the_charge_cutoff(percent, expected):
 
 def test_warm_charging_is_named_before_generic_ac_warmth():
     """Both rules ask for gentle here; the specific one has to report why."""
-    decision = PolicyEngine().decide(
-        DEFAULTS, sample(percent=79, temperature=39.0, charging=True)
-    )
+    decision = PolicyEngine().decide(DEFAULTS, sample(percent=79, temperature=39.0, charging=True))
 
     assert (decision.action, decision.reason) == (Action.GENTLE, DecisionReason.WARM_CHARGING)
 
@@ -132,9 +130,7 @@ def test_cooldown_without_a_reading_keeps_the_job_paused():
 def test_missing_temperature_skips_only_the_thermal_rules():
     engine = PolicyEngine()
 
-    warm_charge_path = engine.decide(
-        DEFAULTS, sample(percent=20, temperature=None, charging=True)
-    )
+    warm_charge_path = engine.decide(DEFAULTS, sample(percent=20, temperature=None, charging=True))
     battery_path = engine.decide(
         DEFAULTS, sample(source=PowerSource.BATTERY, percent=90, temperature=None)
     )

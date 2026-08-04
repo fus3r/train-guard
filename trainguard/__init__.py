@@ -1,3 +1,3 @@
 from .cli import __version__, main
 
-__all__ = ["main", "__version__"]
+__all__ = ["__version__", "main"]

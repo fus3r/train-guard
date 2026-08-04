@@ -90,9 +90,7 @@ def is_guard_process(process: psutil.Process) -> bool:
         command = " ".join(process.cmdline()).lower()
     except (psutil.Error, OSError):
         return False
-    return "__supervise" in command and (
-        "trainguard" in command or "train-guard" in command
-    )
+    return "__supervise" in command and ("trainguard" in command or "train-guard" in command)
 
 
 class ProcessController:
@@ -157,8 +155,7 @@ class ProcessController:
         if is_guard_process(process):
             return True
         return any(
-            _same_process(process, identity) is not False
-            for identity in self._excluded_identities
+            _same_process(process, identity) is not False for identity in self._excluded_identities
         )
 
     def resolve(self, spec: JobSpec) -> TargetSnapshot:
@@ -268,17 +265,11 @@ class ProcessController:
                     check=False,
                 )
                 if result.returncode:
-                    raise OSError(
-                        f"taskpolicy could not background process {process.pid}"
-                    )
+                    raise OSError(f"taskpolicy could not background process {process.pid}")
                 changed = True
             elif self.system == "Linux":
                 cpu_affinity = getattr(process, "cpu_affinity", None)
-                if (
-                    state.affinity
-                    and len(state.affinity) > 1
-                    and cpu_affinity is not None
-                ):
+                if state.affinity and len(state.affinity) > 1 and cpu_affinity is not None:
                     cpu_affinity(state.affinity[::2])
                     changed = True
                 ionice = getattr(process, "ionice", None)
@@ -334,9 +325,7 @@ class ProcessController:
             if state.ionice_class is not None:
                 ionice = getattr(process, "ionice", None)
                 if ionice is None or state.ionice_value is None:
-                    raise OSError(
-                        f"cannot restore I/O priority for process {process.pid}"
-                    )
+                    raise OSError(f"cannot restore I/O priority for process {process.pid}")
                 ionice(state.ionice_class, state.ionice_value)
                 changed = True
         elif self.system == "Windows" and state.priority is not None:

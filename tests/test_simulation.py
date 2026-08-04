@@ -15,7 +15,6 @@ from trainguard.simulation import (
     simulate_policy,
 )
 
-
 EXAMPLE_TRACE = Path(__file__).parents[1] / "examples" / "power-trace.jsonl"
 
 
@@ -158,9 +157,7 @@ def test_trace_errors_identify_the_file_and_line(tmp_path, rows, message, line):
 
 
 def test_only_a_torn_final_line_is_tolerated(tmp_path):
-    complete = json.dumps(
-        {"observation": _observation("2026-07-26T09:00:00Z").to_dict()}
-    )
+    complete = json.dumps({"observation": _observation("2026-07-26T09:00:00Z").to_dict()})
     live = tmp_path / "live.jsonl"
     live.write_text(complete + "\n" + '{"observation":{"sou', encoding="utf-8")
     assert len(load_trace(live)) == 1
@@ -171,9 +168,7 @@ def test_only_a_torn_final_line_is_tolerated(tmp_path):
         load_trace(corrupt)
 
 
-def test_simulate_cli_is_offline_and_emits_versioned_json(
-    tmp_path, monkeypatch, capsys
-):
+def test_simulate_cli_is_offline_and_emits_versioned_json(tmp_path, monkeypatch, capsys):
     state_home = tmp_path / "must-not-be-created"
     candidate = tmp_path / "candidate.json"
     candidate.write_text('{"run_on_battery": true}', encoding="utf-8")
@@ -214,9 +209,7 @@ def test_value_equal_inputs_have_equal_fingerprints():
         == simulate_policy(PolicyConfig(), [with_zero])["observations_sha256"]
     )
     assert (
-        simulate_policy(PolicyConfig(temp_pause_c=42), [_observation(timestamp)])[
-            "policy_sha256"
-        ]
+        simulate_policy(PolicyConfig(temp_pause_c=42), [_observation(timestamp)])["policy_sha256"]
         == simulate_policy(PolicyConfig(temp_pause_c=42.0), [_observation(timestamp)])[
             "policy_sha256"
         ]
