@@ -140,6 +140,26 @@ def test_status_names_restart_semantics(monkeypatch, capsys):
     assert "35°C" in output and "38°C" in output and "42°C" in output
 
 
+def test_status_reports_macos_battery_details(monkeypatch, capsys):
+    pin_sensors(monkeypatch)
+    monkeypatch.setattr(cli, "SYSTEM", "Darwin")
+    monkeypatch.setattr(cli, "_agent_installed", lambda: False)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="Cycle Count: 42\nCondition: Normal\nMaximum Capacity: 91%\nNoise: ignored\n"
+        ),
+    )
+
+    assert cli.main(["status"]) == 0
+    output = capsys.readouterr().out
+    assert "Cycle Count: 42" in output
+    assert "Condition: Normal" in output
+    assert "Maximum Capacity: 91%" in output
+    assert "Noise: ignored" not in output
+
+
 def test_status_shows_missing_readings_instead_of_defaults(monkeypatch, capsys):
     """A host with no battery used to be reported as a full charge."""
     pin_sensors(

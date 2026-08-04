@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -34,7 +35,8 @@ def kernel_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     compiler = shutil.which("c++") or shutil.which("clang++") or shutil.which("g++")
     if compiler is None:
         pytest.skip("no C++ compiler available")
-    binary = tmp_path_factory.mktemp("kernel") / "train-guard-kernel"
+    binary_name = "train-guard-kernel.exe" if os.name == "nt" else "train-guard-kernel"
+    binary = tmp_path_factory.mktemp("kernel") / binary_name
     build = subprocess.run(
         [
             compiler,
