@@ -1019,9 +1019,14 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return 0
 
     facts = report["trace_facts"]
+    engine_note = (
+        " (verified against the Python reference)"
+        if report["kernel_verified_against_reference"]
+        else ""
+    )
     print(
         f"trace: {trace_path}  samples={report['samples']}  "
-        f"elapsed={report['elapsed_seconds']:g}s  engine={report['engine']}"
+        f"elapsed={report['elapsed_seconds']:g}s  engine={report['engine']}{engine_note}"
     )
 
     def coverage(value: Optional[float]) -> str:

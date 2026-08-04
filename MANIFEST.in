@@ -1,4 +1,8 @@
 include config.example.json
+include native/CMakeLists.txt
+include native/replay_kernel.cpp
+prune native/build
 recursive-include examples *.json *.jsonl
 recursive-include macos *.env *.md *.sh
 recursive-include tests *.py
+recursive-include tools *.py

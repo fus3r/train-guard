@@ -34,6 +34,18 @@ jobs:
         run: python -m pip install -e ".[test]"
       - name: Run tests
         run: python -m pytest
+      - name: Build native replay kernel
+        run: |
+          cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/build --config Release
+      - name: Run bit-exact differential benchmark
+        shell: bash
+        run: |
+          kernel="native/build/train-guard-kernel"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            kernel="native/build/Release/train-guard-kernel.exe"
+          fi
+          python tools/bench_sweep.py --samples 4000 --kernel "${kernel}"
       - name: Compile package
         run: python -m compileall -q trainguard
       - name: Check legacy macOS script syntax
@@ -82,12 +94,18 @@ jobs:
               "config.example.json",
               "examples/power-trace.jsonl",
               "macos/train-guard.sh",
+              "native/CMakeLists.txt",
+              "native/replay_kernel.cpp",
               "tests/conftest.py",
               "tests/test_e2e.py",
+              "tests/test_native.py",
+              "tools/bench_sweep.py",
           )
           for path in required:
               if not any(name.endswith(f"/{path}") for name in names):
                   raise SystemExit(f"source archive is missing {path}")
+          if any("/native/build/" in f"/{name}/" for name in names):
+              raise SystemExit("source archive contains native/build artifacts")
           PY
       - name: Install and test the source archive in a clean environment
         run: |

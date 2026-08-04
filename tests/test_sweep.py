@@ -121,10 +121,12 @@ def test_sweep_cli_is_offline_and_states_its_limitations(tmp_path, monkeypatch, 
     assert payload["baseline"]["clairvoyant"]["efficiency"] == 0.75
 
 
-def test_sweep_rejects_unavailable_or_invalid_engines():
+def test_sweep_rejects_unavailable_or_invalid_engines(monkeypatch):
     observations = load_trace(EXAMPLE_TRACE)
     grid = parse_grid('{"run_on_battery":[true]}')
     with pytest.raises(SweepError, match="engine must be"):
         run_sweep(PolicyConfig(), grid, observations, engine="rust")
-    with pytest.raises(SweepError, match="not available"):
+    monkeypatch.delenv("TRAIN_GUARD_KERNEL", raising=False)
+    monkeypatch.setattr("trainguard.sweep.find_kernel", lambda: None)
+    with pytest.raises(SweepError, match="engine=native requires"):
         run_sweep(PolicyConfig(), grid, observations, engine="native")

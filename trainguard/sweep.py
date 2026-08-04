@@ -11,6 +11,7 @@ import itertools
 import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 if __package__:
@@ -25,6 +26,7 @@ if __package__:
     )
     from .config import ConfigError, PolicyConfig, policy_from_mapping
     from .model import Action, DecisionReason, Observation, PowerSource
+    from .native import KernelError, KernelRow, find_kernel, fnv1a_decisions, run_kernel
     from .policy import PolicyEngine
     from .simulation import TraceError, _fingerprint, ordered_timestamps
 else:  # Keep direct CLI execution from a checkout working.
@@ -42,15 +44,13 @@ else:  # Keep direct CLI execution from a checkout working.
     from policy import PolicyEngine
     from simulation import TraceError, _fingerprint, ordered_timestamps
 
+    from native import KernelError, KernelRow, find_kernel, fnv1a_decisions, run_kernel
+
 
 DEFAULT_HOT_REFERENCE_C = 35.0
 DEFAULT_LOW_BATTERY_REFERENCE_PCT = 20.0
 _GRID_EXAMPLE = '{"temp_pause_c":[40,42],"run_on_battery":[true,false]}'
-_ACTION_CODES = {Action.FULL: 0, Action.GENTLE: 1, Action.STOP: 2}
-_REASON_CODES = {reason: index for index, reason in enumerate(DecisionReason)}
-_FNV_OFFSET = 0xCBF29CE484222325
-_FNV_PRIME = 0x100000001B3
-_UINT64 = 0xFFFFFFFFFFFFFFFF
+_ACTION_DIGITS = {Action.FULL: "0", Action.GENTLE: "1", Action.STOP: "2"}
 
 
 class SweepError(ValueError):
@@ -61,19 +61,6 @@ class SweepError(ValueError):
 class SweepGrid:
     fields: tuple[str, ...]
     combinations: tuple[dict[str, Any], ...]
-
-
-@dataclass(frozen=True)
-class _SweepRow:
-    full_seconds: float
-    gentle_seconds: float
-    stop_seconds: float
-    run_seconds: float
-    hot_degc_seconds: float
-    low_battery_run_seconds: float
-    action_transitions: int
-    decision_transitions: int
-    checksum: str
 
 
 def parse_grid(text: str, source: str = "grid") -> SweepGrid:
@@ -139,16 +126,6 @@ def expand_grid(
     return candidates, rejected
 
 
-def _decision_checksum(
-    decisions: Sequence[tuple[Action, DecisionReason]],
-) -> str:
-    value = _FNV_OFFSET
-    for action, reason in decisions:
-        value = ((value ^ _ACTION_CODES[action]) * _FNV_PRIME) & _UINT64
-        value = ((value ^ _REASON_CODES[reason]) * _FNV_PRIME) & _UINT64
-    return format(value, "016x")
-
-
 def _python_rows(
     policies: Sequence[PolicyConfig],
     observations: Sequence[Observation],
@@ -156,8 +133,11 @@ def _python_rows(
     *,
     hot_ref_c: float,
     low_battery_ref_pct: float,
-) -> list[_SweepRow]:
-    rows: list[_SweepRow] = []
+    emit_actions: bool = False,
+) -> list[KernelRow]:
+    """Compute reference aggregates in the native kernel's operation order."""
+
+    rows: list[KernelRow] = []
     for policy in policies:
         engine = PolicyEngine()
         action_seconds = {
@@ -182,7 +162,9 @@ def _python_rows(
             if action is not Action.STOP:
                 run_seconds += duration
                 if observation.temperature_c is not None:
-                    hot_degc_seconds += max(0.0, observation.temperature_c - hot_ref_c) * duration
+                    excess = observation.temperature_c - hot_ref_c
+                    if excess > 0.0:
+                        hot_degc_seconds += excess * duration
                 if (
                     observation.source is PowerSource.BATTERY
                     and observation.percent is not None
@@ -196,7 +178,7 @@ def _python_rows(
             previous = signature
 
         rows.append(
-            _SweepRow(
+            KernelRow(
                 full_seconds=action_seconds[Action.FULL],
                 gentle_seconds=action_seconds[Action.GENTLE],
                 stop_seconds=action_seconds[Action.STOP],
@@ -205,10 +187,37 @@ def _python_rows(
                 low_battery_run_seconds=low_battery_seconds,
                 action_transitions=action_transitions,
                 decision_transitions=decision_transitions,
-                checksum=_decision_checksum(decisions),
+                checksum=fnv1a_decisions(decisions),
+                actions=(
+                    "".join(_ACTION_DIGITS[action] for action, _ in decisions)
+                    if emit_actions
+                    else None
+                ),
             )
         )
     return rows
+
+
+def _verify_kernel_row(python_row: KernelRow, kernel_row: KernelRow, kernel: Path) -> None:
+    """Refuse native results if any baseline aggregate differs by one bit."""
+
+    fields = (
+        "full_seconds",
+        "gentle_seconds",
+        "stop_seconds",
+        "run_seconds",
+        "hot_degc_seconds",
+        "low_battery_run_seconds",
+        "action_transitions",
+        "decision_transitions",
+        "checksum",
+    )
+    mismatches = [name for name in fields if getattr(python_row, name) != getattr(kernel_row, name)]
+    if mismatches:
+        raise SweepError(
+            f"native kernel {kernel} disagrees with the Python reference on the baseline "
+            f"policy ({', '.join(mismatches)}); refusing its results"
+        )
 
 
 def trace_facts(
@@ -261,7 +270,7 @@ def trace_facts(
     }
 
 
-def _pareto_flags(rows: Sequence[_SweepRow]) -> list[bool]:
+def _pareto_flags(rows: Sequence[KernelRow]) -> list[bool]:
     """Mark candidates not dominated on run up, exposures down."""
 
     flags: list[bool] = []
@@ -290,8 +299,8 @@ def _pareto_flags(rows: Sequence[_SweepRow]) -> list[bool]:
 def _candidate_report(
     overrides: dict[str, Any],
     policy: PolicyConfig,
-    row: _SweepRow,
-    baseline_row: _SweepRow,
+    row: KernelRow,
+    baseline_row: KernelRow,
     elapsed: float,
     pareto_optimal: Optional[bool],
     hot_frontier: CostFrontier,
@@ -350,12 +359,10 @@ def run_sweep(
     hot_ref_c: float = DEFAULT_HOT_REFERENCE_C,
     low_battery_ref_pct: float = DEFAULT_LOW_BATTERY_REFERENCE_PCT,
 ) -> dict[str, Any]:
-    """Evaluate a validated grid with the pure Python policy engine."""
+    """Evaluate a validated grid with Python or a verified native kernel."""
 
     if engine not in {"auto", "python", "native"}:
         raise SweepError("engine must be auto, python or native")
-    if engine == "native":
-        raise SweepError("engine=native is not available in this build; use auto or python")
     if not math.isfinite(float(hot_ref_c)) or not -100 <= hot_ref_c <= 200:
         raise SweepError("hot reference must be between -100 and 200")
     if not math.isfinite(float(low_battery_ref_pct)) or not 0 <= low_battery_ref_pct <= 100:
@@ -372,13 +379,48 @@ def run_sweep(
     if not candidates:
         raise SweepError("every grid combination was rejected; nothing to evaluate")
     policies = [base] + [policy for _, policy in candidates]
-    rows = _python_rows(
-        policies,
-        observations,
-        durations,
-        hot_ref_c=hot_ref_c,
-        low_battery_ref_pct=low_battery_ref_pct,
-    )
+
+    try:
+        kernel = find_kernel() if engine in {"auto", "native"} else None
+        if engine == "native" and kernel is None:
+            raise SweepError(
+                "engine=native requires the replay kernel; build native/ and put "
+                "train-guard-kernel on PATH or set TRAIN_GUARD_KERNEL"
+            )
+
+        engine_used = "python"
+        kernel_verified = False
+        if kernel is not None:
+            kernel_rows = run_kernel(
+                kernel,
+                policies,
+                observations,
+                timestamps,
+                hot_ref_c=hot_ref_c,
+                low_battery_ref_pct=low_battery_ref_pct,
+            )
+            baseline_reference = _python_rows(
+                [base],
+                observations,
+                durations,
+                hot_ref_c=hot_ref_c,
+                low_battery_ref_pct=low_battery_ref_pct,
+            )[0]
+            _verify_kernel_row(baseline_reference, kernel_rows[0], kernel)
+            rows = kernel_rows
+            engine_used = "native"
+            kernel_verified = True
+        else:
+            rows = _python_rows(
+                policies,
+                observations,
+                durations,
+                hot_ref_c=hot_ref_c,
+                low_battery_ref_pct=low_battery_ref_pct,
+            )
+    except KernelError as exc:
+        raise SweepError(str(exc)) from exc
+
     baseline_row, candidate_rows = rows[0], rows[1:]
     elapsed = (timestamps[-1] - timestamps[0]).total_seconds()
 
@@ -415,8 +457,8 @@ def run_sweep(
 
     return {
         "schema_version": 1,
-        "engine": "python",
-        "kernel_verified_against_reference": False,
+        "engine": engine_used,
+        "kernel_verified_against_reference": kernel_verified,
         "hot_reference_c": hot_ref_c,
         "low_battery_reference_pct": low_battery_ref_pct,
         "samples": len(observations),
