@@ -1,319 +1,390 @@
 # train-guard
 
+_A training-job guard for laptops._
+
 [![CI](https://github.com/fus3r/train-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/fus3r/train-guard/actions/workflows/ci.yml)
 
-`train-guard` supervises one long-running job on a laptop. It can pause the
-process tree when AC power is removed, lower its scheduling priority when the
-battery is warm, pause at a configured temperature, and continue the same live
-processes after power returns.
+`train-guard` is a local process supervisor for long-running compute jobs. It
+observes the laptop's power source, charge level and available battery
+temperature, then applies one of three actions to the job's process tree:
+`full`, `gentle` or `stop`. The same policy can be replayed offline against
+recorded JSON Lines traces before it controls a live process.
 
-The operating system remains responsible for CPU and SoC protection. This tool
-only applies a job-level battery and power policy.
+This is a workload policy, not a hardware safety controller. The operating
+system and firmware remain responsible for thermal and electrical protection.
 
-```bash
-train-guard run --name train -- python train.py --epochs 200
-train-guard attach --match "python train.py"
-train-guard status
-train-guard stop train
-```
+## Quick start
 
-This repository is a public release snapshot. The package is MIT licensed.
-
-## What pause and gentle mode mean
-
-Pause and resume use host process APIs through `psutil`. On POSIX systems this
-is equivalent to `SIGSTOP` and `SIGCONT`. The process stays in memory, and
-multiprocessing children are included. `train-guard` records the PID and
-creation time only after it successfully suspends a process. A process that was
-already stopped remains externally owned and is never resumed by the guard. If
-another actor resumes a suspension that the guard does own while the policy
-still says `stop`, the guard reapplies that suspension on the next poll.
-
-Gentle mode is a best-effort scheduling request:
-
-- macOS applies `taskpolicy -b` and later clears that hint with `taskpolicy
-  -B`. The kernel still chooses the cores, so this does not pin a job to
-  efficiency cores. `taskpolicy` cannot read and reconstruct an external
-  background hint that existed before `train-guard`.
-- Linux captures the current CPU affinity and I/O class before changing them,
-  then restores those captured values.
-- Windows captures the current priority class before switching to
-  `IDLE_PRIORITY_CLASS`, then restores that exact class.
-
-Owned suspensions and scheduling captures follow process identity across
-controller replacement. They are also released when a process leaves the
-target set, including when a match-based target becomes empty.
-
-Charging tools such as AlDente or `batt` manage charge limits. System tools such
-as TLP and auto-cpufreq manage broader machine policy. `train-guard` only
-controls the named job.
-
-## Install
-
-The package is not on PyPI. Install it from a checkout:
+The package currently installs from a checkout:
 
 ```bash
 git clone https://github.com/fus3r/train-guard.git
 cd train-guard
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -e .
 ```
 
-You can also run `python trainguard/cli.py status` without installing the
-command. A standalone macOS shell implementation is under [`macos/`](macos/).
+Launch a job and give it a stable name:
+
+```bash
+train-guard config --init
+train-guard run --name experiment -- python train.py --epochs 200
+```
+
+The worker and its supervisor run in the background. Worker output goes to
+`~/.train-guard/logs/experiment.log`.
+
+Inspect the live decision and recent transitions:
+
+```bash
+train-guard status
+train-guard events experiment --limit 10
+train-guard doctor
+```
+
+Stop supervising without killing the worker:
+
+```bash
+train-guard stop experiment
+```
+
+Use `train-guard stop experiment --kill` only when the worker process tree
+should also be terminated.
+
+## What the supervisor guarantees
+
+The process controller records which state changes it made.
+
+- A launched process is identified by PID and creation time. Reuse of the same
+  PID does not make a new process part of the old job.
+- Children are resolved on each policy cycle. The supervisor never targets
+  itself; a match-based supervisor also excludes the exact CLI process that
+  launched it. When a live process leaves the resolved target set, any
+  suspension or scheduling change owned by `train-guard` is released.
+- `train-guard` resumes only processes that it suspended. A process stopped by
+  a user or another tool stays stopped.
+- Linux affinity and I/O class, and Windows process-priority changes made by
+  `gentle`, are tracked separately and restored on `full`, detach, handled
+  shutdown or recovery.
+- An inter-process lock serializes creation of each job name, so simultaneous
+  commands cannot launch duplicate supervisors for the same name.
+- `run` and `attach` return success only after the detached supervisor writes a
+  matching PID-and-creation-time readiness record. A failed startup terminates
+  child processes created by that attempt, removes its metadata and restores
+  the previous login restart specification, if one existed.
+- Runtime JSON is schema-checked on read, including every recovery identity and
+  reversible scheduling record, then flushed and replaced atomically.
+  Recovery state without matching job metadata blocks reuse of that name and
+  remains recoverable. Structured events are appended to a separate JSON Lines
+  journal.
+- A bad live configuration is rejected. The running supervisor keeps the last
+  valid policy and records the error.
+- `SIGINT`, `SIGTERM` and handled runtime failures release owned process
+  changes. If a supervisor dies abruptly, `recover` uses its last runtime
+  record and retains it when permissions prevent complete recovery.
+
+The full lifecycle and state model are documented in
+[`docs/architecture.md`](docs/architecture.md). Known failure cases and manual
+recovery steps are in [`docs/failure-model.md`](docs/failure-model.md).
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `run --name NAME -- COMMAND` | launch and supervise a new command |
+| `attach --pid PID --name NAME` | supervise one existing process by identity |
+| `attach --match TEXT --name NAME` | wait for and supervise matching processes |
+| `status [--json]` | show sensors, policy, supervisors and restart specs |
+| `list [--json]` | show a compact job list |
+| `events NAME [--limit N] [--json]` | read the structured event journal |
+| `simulate TRACE [--config FILE] [--compare-config FILE] [--json]` | replay or compare policies against observation or event JSONL |
+| `sweep TRACE --grid FILE [--config FILE] [--engine auto\|python\|native] [--json]` | evaluate a grid of candidate policies and report Pareto-optimal trade-offs |
+| `stop NAME` | release owned process changes and detach |
+| `stop NAME --kill` | release owned changes, then terminate the process tree |
+| `recover NAME` | release changes recorded by a dead supervisor |
+| `config --init` | write the default policy |
+| `config --check` | validate the current policy without starting a job |
+| `doctor [--json]` | check configuration, state access, sensors and stale jobs |
+| `install-agent` | install login restart integration |
+| `uninstall-agent` | remove current and legacy login integration |
+
+Run `train-guard COMMAND --help` for all options.
+
+`status --json`, `doctor --json` and replay reports carry
+`schema_version: 1`. `doctor` validates stored metadata, process identities,
+runtime JSON and login restart specifications in addition to checking sensors
+and stale supervisors.
+
+## Policy
+
+`~/.train-guard/config.json` is optional. Without it, the defaults below are
+used.
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `poll` | `20` | seconds between samples |
+| `run_on_battery` | `false` | allow work while unplugged |
+| `battery_floor_pct` | `30` | pause at or below this charge |
+| `battery_band` | `"gentle"` | action above the battery floor |
+| `ac_band` | `"full"` | normal action on AC |
+| `temp_charge_gentle_c` | `35` | use gentle mode while warm and charging below the cutoff |
+| `charge_cool_until_pct` | `80` | charge cutoff for the warm-charging rule |
+| `temp_gentle_c` | `38` | use gentle mode on AC at or above this temperature |
+| `temp_pause_c` | `42` | enter a thermal pause at or above this temperature |
+| `temp_resume_c` | `36` | leave a thermal pause at or below this temperature |
+
+Validate changes before relying on them:
+
+```bash
+train-guard config --check
+```
+
+The supervisor reloads this file while it runs. Unknown keys, invalid types and
+inconsistent temperature thresholds are rejected. Version 0.1 keys
+`temp_ecore_c` and `temp_charge_ecore_c` are migrated when read; specifying an
+old and new key with conflicting values is rejected.
+
+Thermal pause has hysteresis. Once `temp_pause_c` is reached, the job remains
+stopped until `temp_resume_c` is reached. If no battery temperature is exposed,
+thermal rules are skipped and the event data includes a warning.
+
+## Offline policy replay
+
+Use `simulate` to check a configuration without starting or modifying a
+process:
+
+```bash
+train-guard simulate examples/power-trace.jsonl \
+  --config config.example.json
+train-guard simulate ~/.train-guard/logs/experiment.events.jsonl --json
+train-guard simulate examples/power-trace.jsonl \
+  --config config.example.json \
+  --compare-config examples/battery-enabled-policy.json
+```
+
+The example trace covers normal AC work, warm charging, thermal hysteresis and
+an unplugged interval. With the example configuration it replays seven samples
+over 1,800 seconds: 600 seconds `full`, 300 seconds `gentle` and 900 seconds
+`stop`.
+
+Reports contain both sample counts and time-weighted action shares. Each
+observation is assumed to hold until the next timestamp; the final sample has
+zero duration. Input validation rejects non-finite measurements, timestamps
+without offsets and reverse-ordered traces. The trace schema and interpretation
+are documented in [`docs/policy-replay.md`](docs/policy-replay.md).
+
+Handled stop, worker-exit, shutdown and failure paths append a terminal
+observation to close the final recorded interval. Live journals remain
+transition-oriented, so a replay of a currently running job is complete only
+through its most recent recorded observation.
+
+Comparison mode replays both policies on the same immutable observations and
+reports candidate-minus-baseline seconds, percentage points, transition deltas
+and every decision disagreement. Reports embed canonical SHA-256 fingerprints
+of the validated policies and observations; these identify replay inputs, not
+measured battery or throughput gains.
+
+## Policy sweep
+
+`sweep` extends the comparison from one candidate to a whole grid:
+
+```bash
+train-guard sweep examples/power-trace.jsonl \
+  --grid grid.json --config config.example.json
+```
+
+where `grid.json` maps policy fields to candidate values, for example
+`{"temp_pause_c": [40, 42, 44], "run_on_battery": [true, false]}`. Every
+combination is validated, merged over the baseline and replayed on the
+same observations. Candidates are scored on permitted run time,
+degree-seconds above a reference temperature while running, and time
+running on a low battery, then marked Pareto-optimal when no other
+candidate does at least as well on all three axes and better on one.
+
+Each candidate also carries a clairvoyant efficiency: its permitted
+work divided by the exact optimum of a joint fractional schedule at the
+candidate's own hot and low-battery exposure. Dynamic power-management research
+has used offline bounds with full trace knowledge since the late 1990s. Here,
+the bound applies only to this replay. 100% means no replayed policy, with any
+thresholds and any hysteresis, could have permitted more work on that
+trace without more exposure. Independent one-axis bounds remain in the
+report as diagnostics; the reported bound is one schedule satisfying
+both budgets at once. The joint optimizer is checked against an
+independent exact-rational LP oracle. Its reported temperature cutoff is
+explicitly hot-only, not a description of the joint schedule.
+
+These metrics re-weight recorded exposure under each policy's actions.
+They do not simulate how different actions would have changed the pack's
+temperature or drain, and they are not battery-life predictions. The
+default 35 °C reporting reference uses Apple's published MacBook ambient
+ceiling as context. Battery University describes temperatures above 30 °C as
+elevated; neither value is a measured pack cutoff. The report also computes
+trace-level facts such as degree-seconds above the reference, dwell at ≥80 %
+charge and equivalent full cycles. These facts describe the recording itself.
+Details, citations and limitations:
+[`docs/policy-sweep.md`](docs/policy-sweep.md).
+
+Large sweeps can use an optional native replay kernel
+(`native/replay_kernel.cpp`, C++17, no dependencies). Python remains the
+reference implementation. Floats cross the process boundary as hexadecimal
+literals, the build disables
+floating-point contraction, and before any kernel result is used the
+baseline policy is replayed by both engines and every aggregate,
+including a fingerprint of the entire decision sequence, must match
+CPython bit for bit. CI rebuilds the kernel with GCC, Apple Clang and
+MSVC on every push and re-runs that differential check. Wheels stay pure
+Python; without the kernel, `sweep` uses the same engine the live
+supervisor runs.
+
+```bash
+cmake -S native -B native/build && cmake --build native/build --config Release
+python tools/bench_sweep.py --kernel native/build/train-guard-kernel
+```
+
+The kernel spreads whole policies over worker threads: each policy is
+evaluated start-to-finish by one thread and rows are emitted in input
+order, so kernel output is byte-identical for every thread count and
+the differential check is unaffected. The bundled benchmark evaluates
+421 policies over 20,000 observations, or 8.42 million decisions, and
+checks every row before reporting hardware-specific wall-clock timings.
+Timing is not an acceptance gate. Run the script for results on your machine.
 
 ## Platform behavior
 
-| Platform | Pause and resume | Gentle mode | Battery temperature | Login restart |
+| Platform | `stop` | `gentle` | Battery temperature | Login restart |
 |---|---|---|---|---|
-| macOS | process suspend and resume | background scheduling hint | `ioreg`, no sudo | launchd starts a new process |
-| Linux | process suspend and resume | reduced CPU affinity, idle I/O | psutil sensors or sysfs | systemd user service starts a new process |
-| Windows | process suspend and resume | idle priority class | usually unavailable | scheduled task starts a new process |
+| macOS | suspend and resume through `psutil` | `taskpolicy` background hint | Apple Smart Battery data when exposed | per-user LaunchAgent |
+| Linux | suspend and resume through `psutil` | reduced CPU affinity and idle I/O priority | `psutil` or battery sysfs when exposed | systemd user unit |
+| Windows | suspend and resume through `psutil` | idle process priority | usually unavailable | per-user scheduled task |
 
-CI runs the policy, CLI, persistence, sensor and child-process tests on macOS,
-Linux and Windows with Python 3.9 and 3.13. Battery temperature still depends
-on the hardware and driver. When no pack sensor is available, thermal rules are
-skipped while power-source and charge rules remain active.
+Gentle mode is a scheduling hint. It does not cap power, set a charge limit or
+guarantee a particular CPU core class. On Linux and Windows, the prior
+affinity, I/O class or process priority is captured and restored when possible.
+These snapshots are written to runtime state so a dead supervisor can be
+recovered without applying them to a reused PID.
 
-## Usage
+macOS `taskpolicy` does not expose the target's previous background flag
+through this adapter. `train-guard` records that it applied the hint and later
+uses `taskpolicy -B` to clear it, but cannot promise to preserve a background
+policy that another tool had already set.
 
-```bash
-# Start a command. Its output is written to ~/.train-guard/logs/<name>.log.
-train-guard run --name bigtrain -- python train.py --epochs 200
+One battery snapshot is read per cycle so power source and percentage describe
+the same observation. The portable `psutil` API exposes AC connection rather
+than a hardware charging-current measurement, so `charging` is inferred as
+plugged in below 100 percent. Non-finite or out-of-range live measurements are
+discarded with a warning. A host that exposes no battery is treated as
+mains-powered and reports that assumption. Linux battery temperature read
+through the `power_supply` sysfs class is interpreted as tenths of a degree,
+the unit that interface defines, so a cold pack cannot be misread as a hot
+one.
 
-# Adopt an existing process.
-train-guard attach --match "python train.py" --name bigtrain
-train-guard attach --pid 12345
+## Sleep, reboot and checkpoints
 
-train-guard list
-train-guard status
-train-guard events bigtrain --limit 10
-train-guard list --json
-train-guard status --json
-train-guard doctor --json
-train-guard stop bigtrain
-train-guard stop bigtrain --kill
-# After status reports a dead supervisor, release its recorded process changes.
-train-guard recover bigtrain
-train-guard config --init
-train-guard config --check
+Sleep preserves RAM, so a suspended worker can continue after wake.
 
-# Replay and compare policies without starting a worker or reading sensors.
-train-guard simulate examples/power-trace.jsonl --json
-train-guard simulate examples/power-trace.jsonl \
-  --compare-config examples/battery-enabled-policy.json
-
-# Evaluate a Cartesian grid of policy values on the same trace.
-train-guard sweep examples/power-trace.jsonl \
-  --grid examples/policy-grid.json --engine python
-```
-
-### Sleep is not reboot
-
-Sleep preserves RAM. A suspended job can continue after the machine wakes.
-
-A reboot destroys the process and its in-memory state. With
-`--restart-on-login`, `train-guard` saves the command line and starts a new
-process at the next login:
+A reboot destroys the process. `--restart-on-login` stores the command and asks
+the login agent to launch it again:
 
 ```bash
-train-guard run --restart-on-login --name bigtrain -- \
+train-guard run --restart-on-login --name experiment -- \
   python train.py --resume-from-checkpoint latest
 train-guard install-agent
 ```
 
-The application must load its own checkpoint if it needs to continue prior
-work. An attached job can wait for a matching process or define a start command:
+The application still needs its own durable checkpoint. `train-guard` cannot
+restore Python, CUDA or model state from RAM.
+
+For an externally launched job, use a match string and optionally a start
+command:
 
 ```bash
-train-guard attach --restart-on-login --name dataprep \
-  --match "build_index.py" --start "bash run_prep.sh"
+train-guard attach --restart-on-login --name indexer \
+  --match "build_index.py" --start "bash run_indexer.sh"
 ```
 
-`--persist` remains as a compatibility alias. It restarts or reattaches after
-login; it cannot restore RAM.
+Installing version 0.3 login integration removes service files left by earlier
+`resume` agents before enabling the current `restart` agent. This prevents both
+versions from starting the same saved job.
 
-## Policy
-
-The supervisor rereads `~/.train-guard/config.json` while it runs. An invalid
-edit is reported in the guard log and runtime state, while the supervisor keeps
-using its last valid policy.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `run_on_battery` | `false` | pause when unplugged |
-| `battery_floor_pct` | `30` | pause at or below this charge when battery running is enabled |
-| `ac_band` | `full` | scheduling band on AC while cool |
-| `battery_band` | `gentle` | scheduling band on battery |
-| `temp_charge_gentle_c` | `35` | gentle mode while warm and charging below the cutoff |
-| `temp_gentle_c` | `38` | gentle mode on AC at or above this pack temperature |
-| `temp_pause_c` | `42` | pause at or above this pack temperature |
-| `temp_resume_c` | `36` | leave a thermal pause at or below this pack temperature |
-| `charge_cool_until_pct` | `80` | charge cutoff for the warm-charging rule |
-
-The default pack thresholds are 35, 38 and 42 degrees Celsius, with resume at
-36. They are conservative choices for this tool, not manufacturer safety
-limits. Apple's published 10 to 35 degree range is an
-[ambient operating range](https://support.apple.com/en-us/102336), not a battery
-pack range.
-
-Version 0.1 keys `temp_ecore_c` and `temp_charge_ecore_c` still load for
-compatibility. New configurations use `gentle` because no supported API
-guarantees a particular core class.
-
-## Diagnostics and offline evaluation
-
-`train-guard config --check` validates the complete policy without starting a
-job. `train-guard doctor [--json]` checks the configuration, state-directory
-access, sensors, supervisor liveness and every metadata, runtime and login
-restart record. Corrupt and orphaned recovery state is reported but never
-repaired or deleted automatically. `status --json` follows the same rule and
-returns a non-zero status while still emitting a versioned, machine-readable
-report. These JSON reports use `schema_version: 1`.
-
-`simulate` accepts raw observation JSON Lines or structured event records that
-contain an `observation`. It never creates the state directory, samples a
-sensor or controls a process. Each observation is treated as holding until the
-next timestamp; the last observation therefore has zero duration unless a
-handled terminal event from the live journal closes the interval. The first
-row in `transitions` is the initial decision, so a report contains
-`decision_transitions + 1` transition rows.
-
-The included trace covers normal AC work, warm charging, thermal hysteresis and
-one battery interval. With the default policy its hand-checked 1,800 seconds
-split into 600 seconds `full`, 300 seconds `gentle` and 900 seconds `stop`.
-Comparison mode evaluates the baseline and candidate on the same immutable
-observations and reports action-second and percentage-point deltas,
-disagreement duration and transition deltas. Canonical SHA-256 fingerprints
-identify the policy and observation values used by a report.
-
-`sweep` validates and deduplicates the Cartesian product in a JSON grid such as
-`{"temp_pause_c": [40, 42, 44], "run_on_battery": [true, false]}`. It reports
-permitted work, hot degree-seconds while work is permitted, low-battery work,
-trace-level facts and the Pareto front. Invalid combinations are counted and
-shown rather than silently coerced.
-
-Each candidate also carries an exact fractional clairvoyant bound at its own
-hot and low-battery exposure budgets. This is one joint two-budget schedule;
-the separate hot-only and low-battery-only optima remain diagnostics and are
-not combined with `min`. The reported temperature cutoff is explicitly the
-hot-only hindsight cutoff, not a threshold for the joint schedule. Tests compare
-the joint optimizer with an independent exact-rational enumeration of compact
-linear-program vertices.
-
-Replay and sweep re-weight a trace recorded under the original actions. They do
-not model how another policy would have changed temperature or charge, and are
-not battery-life or throughput predictions. `auto` currently uses the Python
-policy engine. The `native` engine selector is reserved for the optional replay
-kernel and fails explicitly while that kernel is absent.
-
-## Supervisor loop
-
-Every `poll` seconds, the supervisor takes one battery snapshot, reads the pack
-temperature when the platform exposes it, then evaluates one ordered list of
-rules and keeps the first match:
-
-1. an active thermal cooldown;
-2. the pause threshold `temp_pause_c`;
-3. the battery rules, in the order `run_on_battery`, `battery_floor_pct`,
-   `battery_band`;
-4. the warm-charging rule, below `charge_cool_until_pct` and at or above
-   `temp_charge_gentle_c`;
-5. the warm-AC rule at or above `temp_gentle_c`;
-6. `ac_band`, reported as `no_battery` on a host that exposes no battery.
-
-The match selects `full`, `gentle` or `stop` for the process tree and names the
-rule that produced it. The short guard log and the structured JSON Lines event
-journal record a decision only when its action, reason or observation changes.
-When a managed supervisor exit follows a stable interval, the terminal event
-repeats the last observation with the exit time so that interval has an explicit
-end without logging every sensor poll.
-
-Thermal pause has hysteresis: with the defaults, a job paused at 42 degrees
-stays paused until the pack reaches 36.
-
-### What one observation contains
-
-Power source, charge and charging state come from a single battery snapshot, so
-a decision never mixes a plugged-in reading with a charge read after the cable
-was pulled. Each observation is stamped in UTC to the millisecond, because
-`poll` may be set below one second.
-
-`charging` is a portable inference, plugged in and below 100 percent. It is not
-a charge-current measurement, because the cross-platform battery API does not
-expose one.
-
-A measurement this host does not provide stays absent instead of being replaced
-by a plausible default, and the guard log records why it is missing. An absent
-measurement skips only the rules that need it: a host with no battery at all is
-treated as mains-powered and climbs the same thermal ladder as AC. The one
-exception is an active thermal cooldown, which a reading that disappears cannot
-end.
-
-On Linux, `power_supply/*/temp` is read as tenths of a degree, the unit that
-interface defines, so a cool pack reporting `45` is 4.5 °C. A temperature that
-arrives through psutil carries no guaranteed scale, so only there is a value
-too large for a battery pack rescaled.
-
-Closing the lid needs no special path because the supervisor and worker sleep
-with the laptop. Login persistence creates a new process after reboot.
+At login, the policy is validated before an optional attach `--start` command
+is launched. A failed retry keeps its restart specification and makes a
+best-effort attempt to terminate a start command created by that retry. The
+Linux user unit remains active after the restart helper exits so systemd does
+not stop the detached workers in that unit's control group.
 
 ## Local state
 
-State lives under `~/.train-guard` by default. Set `TRAIN_GUARD_HOME` to move
-it; relative values are resolved before a detached supervisor starts, so the
-parent and child keep using the same directory.
+State is stored under `~/.train-guard` by default:
 
-Job names are limited to 1–64 letters, digits, dots, underscores or hyphens.
-Path components and Windows device names such as `con`, `nul` and `com1` are
-rejected before a worker starts.
-
-Metadata, supervisor identity and current runtime state use separate,
-schema-versioned JSON files under `run/`. Writes are flushed to a temporary file
-and atomically replace the prior value; non-finite JSON numbers are rejected.
-An advisory `<name>.lock` also prevents two commands from creating the same job
-at once. The lock file remains in place for reuse.
-
-Each job also has `logs/<name>.guard.log` for short human-readable messages and
-`logs/<name>.events.jsonl` for independent structured events. The supervisor is
-the single writer while it is alive. `train-guard events <name>` ignores a
-corrupt line and applies `--limit` to valid events rather than raw lines.
-
-Process identity is the pair of PID and creation time, not the PID alone. Every
-tree lookup checks both values before controlling a recorded process. Legacy
-PID-only metadata is upgraded only when the current process predates that
-metadata; otherwise the state is preserved and the migration is refused.
-Match-based attachment also excludes the exact CLI process that launched its
-supervisor, even when the pattern appears in that CLI's own command line.
-Runtime state records only suspensions and reversible scheduling changes that
-the controller actually applied. A failed restoration keeps its identity and
-captured values available for a later retry rather than discarding recovery
-evidence.
-
-Malformed state is reported by `status` rather than guessed or deleted. A
-runtime record left without its metadata is likewise preserved and blocks a
-new job from silently adopting the same name. `run` and `attach` report success
-only after the supervisor writes a readiness record containing its own
-PID-and-creation-time identity. A failed start terminates the children created
-by that attempt and rolls back only that attempt's state.
-
-`SIGINT`, `SIGTERM`, a soft `stop`, root-process exit and handled supervisor
-errors all release the suspensions and scheduling changes owned by the guard.
-If a dead supervisor could not release every change, `train-guard recover
-<name>` retries from the validated runtime identities. A permission-denied
-identity remains recorded as `*_incomplete`, so recovery can be retried without
-targeting a reused PID.
-
-## Tests
-
-```bash
-python -m pip install -e '.[test]'
-python -m pytest
-bash -n macos/train-guard.sh
+```text
+config.json
+logs/<name>.log
+logs/<name>.guard.log
+logs/<name>.events.jsonl
+run/<name>.meta.json
+run/<name>.guard.json
+run/<name>.runtime.json
+run/<name>.ready.json       # transient startup handshake
+run/<name>.lock
+persist/<name>.job
 ```
 
-The GitHub Actions matrix runs on `ubuntu-latest`, `macos-latest` and
-`windows-latest`.
+Set `TRAIN_GUARD_HOME` to isolate a test run or use another state directory.
+Job names are restricted to 64 letters, digits, dots, underscores or hyphens.
+Lock files are retained and reused; the operating-system lock, not file
+existence, indicates an in-progress creation.
+
+Recovery-critical runtime fields are not repaired or partially accepted.
+`status` and `doctor` report a malformed runtime record, while `recover`
+refuses to erase it until the ambiguity has been inspected.
+
+## Development
+
+```bash
+python -m pip install -e ".[dev]"
+python -m ruff check .
+python -m ruff format --check .
+python -m mypy trainguard
+python -m coverage run -m pytest
+python -m coverage report -m
+python -m build
+```
+
+The combined statement-and-branch coverage gate is 90 percent. CI runs on
+Ubuntu, macOS and Windows with Python 3.9 and 3.13, builds the native replay
+kernel with each platform's compiler and checks it against the Python engine
+bit for bit, then builds and installs the wheel in a clean step. The test
+suite includes a real detached `run` → `status` → `events` → `stop`
+lifecycle alongside focused tests that isolate process calls.
+The source archive contains the complete test suite, including its fixtures,
+so the shipped source can be checked independently.
+Third-party workflow actions are pinned to commit SHAs and monitored by
+Dependabot.
+
+The pre-0.3 macOS shell implementation remains under
+[`legacy/macos-shell/`](legacy/macos-shell/). It receives compatibility fixes
+only.
+
+## Limits
+
+- Battery temperature availability depends on the machine and driver.
+- On macOS, clearing the `taskpolicy` background hint cannot reconstruct a
+  background state that predated `train-guard`.
+- Match-based attachment uses a command-line substring. The launching CLI is
+  excluded by PID and creation time, but unrelated commands containing the
+  same substring can still match. Prefer `--pid` when a stable process is
+  already available.
+- Permissions can prevent inspection or control of another user's process.
+- A child created after the final process-tree snapshot can outlive
+  `stop --kill`.
+- An uncatchable supervisor termination can happen between a process suspension
+  or scheduling change and the next runtime write. Check the worker and use
+  operating-system tools if no recoverable record exists.
+- Job-name serialization uses local advisory file locks. Do not share one state
+  directory between hosts through a filesystem with incompatible lock
+  semantics.
 
 ## License
 
-MIT, 2026.
+MIT. See [`LICENSE`](LICENSE).

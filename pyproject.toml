@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "train-guard"
 version = "0.3.0"
-description = "Job-level battery and thermal policy for long-running laptop processes."
+description = "Power-aware process supervision for long-running local compute jobs."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"

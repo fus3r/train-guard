@@ -1,6 +1,11 @@
-# train-guard for macOS
+# Legacy shell implementation for macOS
 
-The shell implementation runs without Python. It can pause a process tree on
+This pre-0.3 shell implementation is retained for users who cannot install
+Python. It receives compatibility fixes only. The Python package is the
+supported implementation and includes validated configuration, PID-reuse
+protection, structured events, stale-state recovery and cross-platform tests.
+
+The shell implementation can pause a process tree on
 battery, request background scheduling while the battery pack is warm, pause at
 the configured high threshold, and continue the same live processes on AC.
 
@@ -39,4 +44,5 @@ symlink:
 ln -s "$PWD/train-guard.sh" ~/.local/bin/train-guard
 ```
 
-Use the Python package from the repository root for Linux or Windows.
+Use the Python package from the repository root for new installations on every
+supported operating system.

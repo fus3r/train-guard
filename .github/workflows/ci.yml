@@ -50,7 +50,7 @@ jobs:
         run: python -m compileall -q trainguard
       - name: Check legacy macOS script syntax
         if: runner.os != 'Windows'
-        run: bash -n macos/train-guard.sh
+        run: bash -n legacy/macos-shell/train-guard.sh
 
   quality:
     name: Quality and package
@@ -92,8 +92,12 @@ jobs:
               names = source.getnames()
           required = (
               "config.example.json",
+              "docs/architecture.md",
+              "docs/failure-model.md",
+              "docs/policy-replay.md",
+              "docs/policy-sweep.md",
               "examples/power-trace.jsonl",
-              "macos/train-guard.sh",
+              "legacy/macos-shell/train-guard.sh",
               "native/CMakeLists.txt",
               "native/replay_kernel.cpp",
               "tests/conftest.py",

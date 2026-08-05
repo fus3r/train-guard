@@ -8,8 +8,8 @@
 # power source, charge %, and battery pack temperature without sudo. macOS already
 # handles CPU/SoC thermal safety.
 #
-# Heat and battery cycling are what age a laptop battery; this protects both.
-# Thresholds + rationale: see README.md. Policy: config.env (reread live).
+# These thresholds are workload policy, not hardware safety limits.
+# Rationale and limitations: ../../README.md. Policy: config.env (reread live).
 #
 # USAGE
 #   train-guard run [--name N] [--restart-on-login] [--cwd DIR] -- <command...>   launch + supervise a job
