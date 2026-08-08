@@ -366,6 +366,9 @@ The pre-0.3 macOS shell implementation remains under
 [`legacy/macos-shell/`](legacy/macos-shell/). It receives compatibility fixes
 only.
 
+Release changes and the verification scope are recorded in
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ## Limits
 
 - Battery temperature availability depends on the machine and driver.
