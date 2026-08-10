@@ -240,6 +240,7 @@ supervisor runs.
 ```bash
 cmake -S native -B native/build && cmake --build native/build --config Release
 python tools/bench_sweep.py --kernel native/build/train-guard-kernel
+python tools/bench_pareto.py
 ```
 
 The kernel spreads whole policies over worker threads: each policy is
@@ -249,6 +250,11 @@ the differential check is unaffected. The bundled benchmark evaluates
 421 policies over 20,000 observations, or 8.42 million decisions, and
 checks every row before reporting hardware-specific wall-clock timings.
 Timing is not an acceptance gate. Run the script for results on your machine.
+
+After replay, Pareto dominance is computed in `O(N + U log U)` time for `N`
+candidate rows and `U` distinct metric triples. The Pareto benchmark checks a
+mixed hand-calculated corpus and an independent pairwise oracle before it
+reports hardware-specific timings; duplicates remain co-optimal.
 
 ## Platform behavior
 

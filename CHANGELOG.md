@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Replace the pairwise Pareto-front scan with an exact
+  `O(N + U log U)` dominance pass while preserving duplicate and tie behavior.
+- Add a reproducible adversarial benchmark checked against a hand-calculated
+  corpus and an independent bounded pairwise oracle.
+
 ## 0.3.0 - 2026-08-08
 
 Version 0.3.0 hardens the cross-platform Python supervisor with explicit

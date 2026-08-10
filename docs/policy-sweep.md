@@ -42,6 +42,20 @@ A candidate is marked Pareto-optimal when no other candidate permits at
 least as much run time with no more hot or low-charge exposure and is
 strictly better on at least one of the three.
 
+The dominance pass sorts distinct metric triples by decreasing run time,
+compresses the heat axis and keeps a prefix minimum of low-charge exposure in
+a Fenwick tree. For `N` rows and `U` distinct triples, it uses
+`O(N + U log U)` time and `O(N + U)` memory instead of comparing every pair.
+Identical triples remain co-optimal because neither is strictly better. This
+is an instance of the multidimensional maxima problem studied by
+[Kung, Luccio and Preparata (1975)](https://doi.org/10.1145/321906.321910),
+not a new optimization method.
+
+`python tools/bench_pareto.py` checks a hand-calculated mixed corpus and a
+bounded prefix against an independent pairwise oracle before timing an
+all-nondominated workload. Its timings describe only the printed Python,
+platform, point count and repeat count; they are not a CI threshold.
+
 ## Reading the numbers honestly
 
 The metrics are exposure re-weightings of a recorded trace, not simulated

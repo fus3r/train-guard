@@ -103,6 +103,7 @@ jobs:
               "tests/conftest.py",
               "tests/test_e2e.py",
               "tests/test_native.py",
+              "tools/bench_pareto.py",
               "tools/bench_sweep.py",
           )
           for path in required:

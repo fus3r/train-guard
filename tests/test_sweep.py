@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import pytest
 
 from trainguard import cli
 from trainguard.config import ConfigError, PolicyConfig
+from trainguard.native import KernelRow
 from trainguard.simulation import load_trace
-from trainguard.sweep import SweepError, expand_grid, parse_grid, run_sweep
+from trainguard.sweep import SweepError, _pareto_flags, expand_grid, parse_grid, run_sweep
 
 EXAMPLE_TRACE = Path(__file__).parents[1] / "examples" / "power-trace.jsonl"
 
@@ -66,6 +68,48 @@ def test_sweep_matches_hand_calculation_and_joint_bound():
     assert candidate["delta_vs_baseline"]["run_seconds"] == 300.0
     assert candidate["clairvoyant"]["efficiency"] == 1.0
     assert candidate["pareto_optimal"] is True
+
+
+def test_pareto_pass_matches_hand_checked_and_pairwise_oracles():
+    def row(run: float, hot: float, low: float) -> KernelRow:
+        return KernelRow(run, 0.0, 0.0, run, hot, low, 0, 0, "0" * 16, None)
+
+    def pairwise_oracle(rows: list[KernelRow]) -> list[bool]:
+        flags = []
+        for candidate in rows:
+            dominated = any(
+                other is not candidate
+                and other.run_seconds >= candidate.run_seconds
+                and other.hot_degc_seconds <= candidate.hot_degc_seconds
+                and other.low_battery_run_seconds <= candidate.low_battery_run_seconds
+                and (
+                    other.run_seconds > candidate.run_seconds
+                    or other.hot_degc_seconds < candidate.hot_degc_seconds
+                    or other.low_battery_run_seconds < candidate.low_battery_run_seconds
+                )
+                for other in rows
+            )
+            flags.append(not dominated)
+        return flags
+
+    mixed = [
+        row(10.0, 5.0, 5.0),
+        row(9.0, 6.0, 6.0),
+        row(10.0, 5.0, 5.0),
+        row(10.0, 4.0, 7.0),
+        row(11.0, 8.0, 2.0),
+        row(8.0, 4.0, 8.0),
+        row(10.0, 6.0, 4.0),
+    ]
+    assert _pareto_flags(mixed) == [True, False, True, True, True, False, True]
+
+    rng = random.Random(20260810)
+    randomized = [
+        row(float(rng.randrange(8)), float(rng.randrange(8)), float(rng.randrange(8)))
+        for _ in range(500)
+    ]
+    randomized.extend([row(9.0, 1.0, 3.0), row(9.0, 1.0, 3.0), row(8.0, 0.0, 4.0)])
+    assert _pareto_flags(randomized) == pairwise_oracle(randomized)
 
 
 def test_direct_policy_construction_enforces_sweep_invariants():

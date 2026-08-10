@@ -106,7 +106,7 @@ else:  # Keep direct execution from a checkout working.
         run_sweep,
     )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1.dev0"
 _SUPERVISOR_START_TIMEOUT_SECONDS = 5.0
 SYSTEM = platform.system()  # 'Darwin' | 'Linux' | 'Windows'
 HOME = Path.home()

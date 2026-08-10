@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import json
 import math
+from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -271,29 +272,42 @@ def trace_facts(
 
 
 def _pareto_flags(rows: Sequence[KernelRow]) -> list[bool]:
-    """Mark candidates not dominated on run up, exposures down."""
+    """Mark candidates not dominated on run up, exposures down.
 
-    flags: list[bool] = []
-    for row in rows:
-        dominated = False
-        for other in rows:
-            if other is row:
-                continue
-            at_least_as_good = (
-                other.run_seconds >= row.run_seconds
-                and other.hot_degc_seconds <= row.hot_degc_seconds
-                and other.low_battery_run_seconds <= row.low_battery_run_seconds
-            )
-            strictly_better = (
-                other.run_seconds > row.run_seconds
-                or other.hot_degc_seconds < row.hot_degc_seconds
-                or other.low_battery_run_seconds < row.low_battery_run_seconds
-            )
-            if at_least_as_good and strictly_better:
-                dominated = True
-                break
-        flags.append(not dominated)
-    return flags
+    Sorting by decreasing run time turns dominance into a two-dimensional
+    prefix-minimum query. Equal metric triples are collapsed for the pass so
+    duplicates remain co-optimal: neither is strictly better than the other.
+    """
+
+    points = [(row.run_seconds, row.hot_degc_seconds, row.low_battery_run_seconds) for row in rows]
+    if not points:
+        return []
+
+    ordered = sorted(set(points), key=lambda point: (-point[0], point[1], point[2]))
+    hot_values = sorted({point[1] for point in ordered})
+    tree = [math.inf] * (len(hot_values) + 1)
+    dominated: set[tuple[float, float, float]] = set()
+
+    def prefix_min(index: int) -> float:
+        best = math.inf
+        while index > 0:
+            best = min(best, tree[index])
+            index -= index & -index
+        return best
+
+    def update(index: int, value: float) -> None:
+        while index < len(tree):
+            tree[index] = min(tree[index], value)
+            index += index & -index
+
+    for point in ordered:
+        _, hot, low_battery = point
+        rank = bisect_left(hot_values, hot) + 1
+        if prefix_min(rank) <= low_battery:
+            dominated.add(point)
+        update(rank, low_battery)
+
+    return [point not in dominated for point in points]
 
 
 def _candidate_report(
