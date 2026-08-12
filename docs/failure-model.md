@@ -45,7 +45,7 @@ the next cycle.
 Missing battery temperature disables thermal rules for that observation. Power
 source and charge rules continue when battery data is available.
 An active thermal cooldown is the exception: it stays active until a reading at
-or below the resume threshold proves that the pack has cooled.
+or below the resume threshold is observed.
 
 Non-finite battery percentages and temperatures outside the supported live
 range are converted to missing values and accompanied by warnings before

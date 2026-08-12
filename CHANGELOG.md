@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-08-12
 
 - Replace the pairwise Pareto-front scan with an exact
   `O(N + U log U)` dominance pass while preserving duplicate and tie behavior.
@@ -18,6 +18,13 @@
 - Add the separate `TGS 1` native protocol for bounded sweep envelopes. Python
   verifies the baseline bit for bit before accepting native rows, while `TGK 1`
   remains unchanged for nominal replay.
+
+The bounded analyses are exact only for the current threshold policy over the
+finite IEEE-754 binary64 representatives admitted by the user-supplied box.
+They do not attach confidence or causal meaning to that box. The reported
+divergence context is not a complete witness or certificate, and bounded-sweep
+survivors form a conservative outer enclosure rather than an exact robust
+Pareto set.
 
 ## 0.3.0 - 2026-08-08
 
