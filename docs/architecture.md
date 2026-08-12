@@ -7,27 +7,108 @@ local state.
 
 ## Data flow
 
-```text
-CLI
- |
- | writes job specification and starts a detached supervisor
- v
-Supervisor -> SensorReader -> Observation -> PolicyEngine -> PolicyDecision
-     |                                                     |
-     |                                                     v
-     +-> ConfigWatcher                              ProcessController
-     |                                                     |
-     +-> runtime snapshot                                  v
-     +-> EventJournal                              worker process tree
-
-Trace JSONL -> SimulationRunner -> Observation -> PolicyEngine -> report
-                                      |                 |
-Candidate config ---------------------+-----------------+-> comparison delta
-User bounds --------------------------+-> exact marginal envelopes and action margin
-
-Candidate grid -> SweepRunner -> PolicyEngine -> nominal Pareto report
-User bounds ----------+-> exact marginal envelopes -> interval-front enclosure
-```
+<figure style="margin: 1.5em 0;">
+  <svg viewBox="0 0 845 612" role="img" aria-label="Live supervision, offline replay and grid sweeps all send observations through the same pure policy engine; only the adapters around it differ." style="max-width: 100%; height: auto; display: block;">
+    <defs>
+      <marker id="tg-ah" markerWidth="8" markerHeight="7" refX="7" refY="3.5" orient="auto-start-reverse">
+        <path d="M0,0 L8,3.5 L0,7 Z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g fill="none" stroke="currentColor" stroke-opacity="0.12">
+      <line x1="25" y1="292" x2="465" y2="292"/>
+      <line x1="615" y1="292" x2="820" y2="292"/>
+      <line x1="25" y1="452" x2="465" y2="452"/>
+      <line x1="615" y1="452" x2="820" y2="452"/>
+    </g>
+    <g font-size="11" font-weight="600" letter-spacing="1.5" fill="currentColor" fill-opacity="0.55">
+      <text x="27" y="34">LIVE SUPERVISION</text>
+      <text x="27" y="320">OFFLINE REPLAY · simulate</text>
+      <text x="27" y="480">OFFLINE SWEEP · sweep</text>
+    </g>
+    <rect x="475" y="130" width="130" height="424" rx="8" fill="var(--md-accent-fg-color)" fill-opacity="0.07" stroke="var(--md-accent-fg-color)" stroke-width="1.5"/>
+    <g text-anchor="middle" fill="currentColor">
+      <text x="540" y="322" font-size="13.5" font-weight="700">PolicyEngine</text>
+      <text x="540" y="339" font-size="10.5" fill-opacity="0.6">policy.py</text>
+      <text x="540" y="358" font-size="11" fill-opacity="0.78">pure state machine</text>
+      <text x="540" y="374" font-size="10.5" fill-opacity="0.78">no I/O · no processes</text>
+    </g>
+    <g fill="var(--md-code-bg-color)" stroke="currentColor" stroke-opacity="0.35">
+      <rect x="215" y="52" width="170" height="32" rx="6"/>
+      <rect x="25" y="140" width="140" height="44" rx="6"/>
+      <rect x="215" y="140" width="170" height="44" rx="6"/>
+      <rect x="645" y="140" width="170" height="44" rx="6"/>
+      <rect x="645" y="224" width="170" height="36" rx="6"/>
+      <rect x="215" y="224" width="170" height="36" rx="6"/>
+      <rect x="25" y="340" width="140" height="44" rx="6"/>
+      <rect x="215" y="340" width="170" height="44" rx="6"/>
+      <rect x="645" y="332" width="170" height="60" rx="6"/>
+      <rect x="25" y="500" width="140" height="44" rx="6"/>
+      <rect x="215" y="500" width="170" height="44" rx="6"/>
+      <rect x="645" y="492" width="170" height="60" rx="6"/>
+    </g>
+    <g text-anchor="middle" fill="currentColor">
+      <text x="300" y="72" font-size="12.5" font-weight="600">CLI</text>
+      <text x="95" y="158" font-size="12.5" font-weight="600">SensorReader</text>
+      <text x="95" y="174" font-size="10" fill-opacity="0.6">sensors.py</text>
+      <text x="300" y="158" font-size="12.5" font-weight="600">Supervisor</text>
+      <text x="300" y="174" font-size="10" fill-opacity="0.6">supervisor.py</text>
+      <text x="730" y="158" font-size="12.5" font-weight="600">ProcessController</text>
+      <text x="730" y="174" font-size="10" fill-opacity="0.6">processes.py</text>
+      <text x="730" y="246" font-size="11.5">worker process tree</text>
+      <text x="300" y="239" font-size="11">runtime.json · events.jsonl</text>
+      <text x="300" y="252" font-size="9.5" fill-opacity="0.6">state after every action</text>
+      <text x="95" y="240" font-size="11.5">config.json</text>
+      <text x="95" y="253" font-size="9.5" fill-opacity="0.6">live reload</text>
+      <text x="95" y="358" font-size="12.5" font-weight="600">Trace JSONL</text>
+      <text x="95" y="374" font-size="10" fill-opacity="0.6">observations or events</text>
+      <text x="300" y="358" font-size="12.5" font-weight="600">SimulationRunner</text>
+      <text x="300" y="374" font-size="10" fill-opacity="0.6">simulation.py</text>
+      <text x="730" y="350" font-size="12" font-weight="600">Replay report</text>
+      <text x="730" y="366" font-size="10" fill-opacity="0.78">time-weighted actions · deltas</text>
+      <text x="730" y="380" font-size="10" fill-opacity="0.78">bounded envelopes · action margin</text>
+      <text x="95" y="518" font-size="12.5" font-weight="600">Candidate grid</text>
+      <text x="95" y="534" font-size="10" fill-opacity="0.6">+ the same trace</text>
+      <text x="300" y="518" font-size="12.5" font-weight="600">SweepRunner</text>
+      <text x="300" y="534" font-size="10" fill-opacity="0.6">sweep.py</text>
+      <text x="730" y="510" font-size="12" font-weight="600">Sweep report</text>
+      <text x="730" y="526" font-size="10" fill-opacity="0.78">nominal Pareto front</text>
+      <text x="730" y="540" font-size="10" fill-opacity="0.78">interval-front enclosure</text>
+    </g>
+    <g stroke="currentColor" stroke-width="1.3" stroke-opacity="0.8" fill="none" marker-end="url(#tg-ah)">
+      <line x1="300" y1="84" x2="300" y2="136"/>
+      <line x1="165" y1="162" x2="211" y2="162"/>
+      <line x1="385" y1="162" x2="471" y2="162"/>
+      <line x1="605" y1="162" x2="641" y2="162"/>
+      <line x1="730" y1="184" x2="730" y2="220"/>
+      <line x1="300" y1="184" x2="300" y2="220"/>
+      <line x1="165" y1="362" x2="211" y2="362"/>
+      <line x1="385" y1="362" x2="471" y2="362"/>
+      <line x1="605" y1="362" x2="641" y2="362"/>
+      <line x1="165" y1="522" x2="211" y2="522"/>
+      <line x1="385" y1="522" x2="471" y2="522"/>
+      <line x1="605" y1="522" x2="641" y2="522"/>
+    </g>
+    <g stroke="currentColor" stroke-width="1.2" stroke-opacity="0.65" stroke-dasharray="4 3" fill="none" marker-end="url(#tg-ah)">
+      <line x1="150" y1="230" x2="250" y2="190"/>
+      <line x1="300" y1="416" x2="300" y2="388"/>
+      <line x1="300" y1="576" x2="300" y2="548"/>
+    </g>
+    <g fill="currentColor" fill-opacity="0.75" font-size="11">
+      <text x="292" y="112" text-anchor="end">starts a detached supervisor</text>
+      <text x="430" y="154" text-anchor="middle">Observation</text>
+      <text x="627" y="154" text-anchor="middle">decision</text>
+      <text x="720" y="206" text-anchor="end">full · gentle · stop</text>
+      <text x="430" y="354" text-anchor="middle">observations</text>
+      <text x="625" y="354" text-anchor="middle">actions</text>
+      <text x="430" y="505" text-anchor="middle">one replay</text>
+      <text x="430" y="517" text-anchor="middle">per policy</text>
+      <text x="625" y="514" text-anchor="middle">objectives</text>
+      <text x="300" y="428" text-anchor="middle" font-size="10.5">optional: candidate config · user bounds</text>
+      <text x="300" y="588" text-anchor="middle" font-size="10.5">optional: user bounds</text>
+    </g>
+  </svg>
+  <figcaption style="font-size: 0.72rem; opacity: 0.75; margin-top: 0.4em;">Live supervision, offline replay and grid sweeps all send observations through the same pure policy engine; only the adapters around it differ.</figcaption>
+</figure>
 
 There is one supervisor per named job. Each cycle follows the same sequence:
 
