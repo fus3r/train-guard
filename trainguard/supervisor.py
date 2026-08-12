@@ -125,6 +125,44 @@ def _report_payload(report: ApplyReport) -> dict[str, Any]:
     return asdict(report)
 
 
+_STOP_KILL_GRACE_SECONDS = 5.0
+
+
+def _terminate_processes(processes: tuple[psutil.Process, ...]) -> int:
+    """Terminate a snapshot, escalate survivors, and count incomplete kills."""
+
+    waiting: list[psutil.Process] = []
+    escalation: list[psutil.Process] = []
+    for process in processes:
+        try:
+            process.terminate()
+            waiting.append(process)
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except (psutil.Error, OSError):
+            escalation.append(process)
+
+    if waiting:
+        _gone, alive = psutil.wait_procs(waiting, timeout=_STOP_KILL_GRACE_SECONDS)
+        escalation.extend(alive)
+
+    killed: list[psutil.Process] = []
+    failures = 0
+    for process in escalation:
+        try:
+            process.kill()
+            killed.append(process)
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except (psutil.Error, OSError):
+            failures += 1
+
+    if killed:
+        _gone, alive = psutil.wait_procs(killed, timeout=_STOP_KILL_GRACE_SECONDS)
+        failures += len(alive)
+    return failures
+
+
 class Supervisor:
     """Own one guard's policy loop and release its process changes on exit."""
 
@@ -232,22 +270,23 @@ class Supervisor:
     def _finish_stop(self, how: str) -> int:
         snapshot = self.controller.resolve(self.spec)
         report = self.controller.release_owned()
+        kill_failures = 0
         if how == "kill":
-            for process in snapshot.processes:
-                try:
-                    process.terminate()
-                except (psutil.Error, OSError):
-                    pass
+            kill_failures = _terminate_processes(snapshot.processes)
+            if kill_failures:
+                report = replace(
+                    report,
+                    access_denied=report.access_denied + kill_failures,
+                )
         event = "stop_incomplete" if report.access_denied else "stopped"
-        message = (
-            "STOP incomplete: owned process state preserved for recovery"
-            if report.access_denied
-            else (
-                "STOP --kill: terminated job"
-                if how == "kill"
-                else "STOP: released owned process changes, detaching"
-            )
-        )
+        if kill_failures:
+            message = "STOP --kill incomplete: process state preserved for recovery"
+        elif report.access_denied:
+            message = "STOP incomplete: owned process state preserved for recovery"
+        elif how == "kill":
+            message = "STOP --kill: terminated job"
+        else:
+            message = "STOP: released owned process changes, detaching"
         self.journal.emit(
             event,
             message,
@@ -259,7 +298,11 @@ class Supervisor:
             return self._retain_incomplete(
                 "stop_incomplete",
                 report,
-                "permission denied while releasing owned process state",
+                (
+                    "one or more job processes could not be terminated"
+                    if kill_failures
+                    else "permission denied while releasing owned process state"
+                ),
             )
         self.store.remove_active_state(self.spec.name)
         return 0

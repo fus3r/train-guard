@@ -45,7 +45,7 @@ and disables temperature rules for that observation.
 ```bash
 train-guard config --init
 train-guard run --name quickstart -- \
-  python -c "import time; print('quickstart running', flush=True); time.sleep(120)"
+  python3 -c "import time; print('quickstart running', flush=True); time.sleep(120)"
 train-guard status
 train-guard events quickstart --limit 10
 train-guard stop quickstart
@@ -55,7 +55,9 @@ Without `--kill`, `stop` releases changes owned by Train Guard and detaches.
 
 ## Replay and bounded sweeps
 
-The bundled trace can be replayed without controlling a process:
+The source archive and tagged checkout include an example trace and policy
+files. From that checkout, a `pipx` or wheel installation can replay them
+without controlling a process.
 
 Create a small policy grid as `grid.json`:
 

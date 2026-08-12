@@ -788,7 +788,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     print(
         f"[train-guard] stop requested for '{name}'"
         + (" (--kill the job)" if args.kill else "")
-        + "; releases owned changes & detaches within one poll. "
+        + "; the supervisor acts after the next policy poll. "
         "(login restart removed)"
     )
     return 0

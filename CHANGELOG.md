@@ -2,6 +2,8 @@
 
 ## 0.4.0 - 2026-08-12
 
+- Make `stop --kill` wait for termination, escalate survivors and retain
+  incomplete state instead of reporting an unconfirmed success.
 - Replace the pairwise Pareto-front scan with an exact
   `O(N + U log U)` dominance pass while preserving duplicate and tie behavior.
 - Add a reproducible adversarial benchmark checked against a hand-calculated

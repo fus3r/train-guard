@@ -173,12 +173,20 @@ def test_supervisor_reports_sensor_warning_and_valid_reload(app_paths):
         worker.wait(timeout=5)
 
 
-def test_incomplete_kill_retains_recovery_state(app_paths):
-    class BrokenProcess:
-        pid = 321
+def test_incomplete_kill_retains_recovery_state(app_paths, monkeypatch):
+    class StubbornProcess:
+        def __init__(self, pid: int, *, deny_kill: bool = False) -> None:
+            self.pid = pid
+            self.deny_kill = deny_kill
+            self.calls: list[str] = []
 
         def terminate(self) -> None:
-            raise psutil.AccessDenied(pid=self.pid)
+            self.calls.append("terminate")
+
+        def kill(self) -> None:
+            self.calls.append("kill")
+            if self.deny_kill:
+                raise psutil.AccessDenied(pid=self.pid)
 
     class DeniedController:
         owned_suspensions: tuple[ProcessIdentity, ...] = ()
@@ -191,10 +199,23 @@ def test_incomplete_kill_retains_recovery_state(app_paths):
             pass
 
         def resolve(self, _spec) -> TargetSnapshot:
-            return TargetSnapshot((BrokenProcess(),), True)  # type: ignore[arg-type]
+            return TargetSnapshot((terminated, denied), True)  # type: ignore[arg-type]
 
         def release_owned(self) -> ApplyReport:
-            return ApplyReport(targeted=1, access_denied=1)
+            return ApplyReport(targeted=2)
+
+    terminated = StubbornProcess(321)
+    denied = StubbornProcess(322, deny_kill=True)
+    waits: list[tuple[tuple[int, ...], float]] = []
+
+    def wait_procs(process_list, timeout):
+        processes_waited = tuple(process_list)
+        waits.append((tuple(process.pid for process in processes_waited), timeout))
+        if len(waits) == 1:
+            return (), processes_waited
+        return processes_waited, ()
+
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
 
     spec = JobSpec.launched("denied", ProcessIdentity(123, 1.0), app_paths.logs / "denied.log")
     store = JobStore(app_paths)
@@ -211,6 +232,9 @@ def test_incomplete_kill_retains_recovery_state(app_paths):
     assert runtime is not None
     assert runtime["state"] == "stop_incomplete"
     assert runtime["process_report"]["access_denied"] == 1
+    assert terminated.calls == ["terminate", "kill"]
+    assert denied.calls == ["terminate", "kill"]
+    assert waits == [((321, 322), 5.0), ((321,), 5.0)]
     assert supervisor.journal.read()[-1]["event"] == "stop_incomplete"
     supervisor._handle_signal(999, None)
     assert supervisor._shutdown_signal == "999"

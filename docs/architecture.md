@@ -242,10 +242,12 @@ limits.
 
 The sweep reuses the objective-envelope pass for every candidate but omits the
 more expensive action-change margin. Its nominal rows may come from verified
-`TGK 1`; bounded rows stay on Python and are reported under a separate engine
-field. Worst-corner versus best-corner interval dominance can certify some
-policies as excluded, while overlapping boxes remain in a conservative outer
-enclosure rather than being labelled an exact robust Pareto set.
+`TGK 1`; when a kernel is available, bounded rows use the separate `TGS 1`
+protocol after Python independently verifies the baseline envelope. The two
+engines are reported separately. Worst-corner versus best-corner interval
+dominance can certify some policies as excluded, while overlapping boxes remain
+in a conservative outer enclosure rather than being labelled an exact robust
+Pareto set.
 
 ## Login restart
 

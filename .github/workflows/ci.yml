@@ -130,10 +130,17 @@ jobs:
       - name: Install and smoke-test the wheel in a clean environment
         run: |
           python -m venv "${RUNNER_TEMP}/train-guard-wheel"
-          "${RUNNER_TEMP}/train-guard-wheel/bin/python" -m pip install dist/*.whl
+          CC=/usr/bin/false CXX=/usr/bin/false \
+            "${RUNNER_TEMP}/train-guard-wheel/bin/python" -m pip install \
+            --only-binary=:all: dist/*.whl
           "${RUNNER_TEMP}/train-guard-wheel/bin/python" -m pip check
           "${RUNNER_TEMP}/train-guard-wheel/bin/train-guard" --version
           "${RUNNER_TEMP}/train-guard-wheel/bin/train-guard" --help > /dev/null
+          wheel_source_root="${RUNNER_TEMP}/train-guard-wheel-source"
+          mkdir -p "${wheel_source_root}"
+          tar -xzf dist/*.tar.gz -C "${wheel_source_root}"
+          wheel_source="$(find "${wheel_source_root}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          cd "${wheel_source}"
           "${RUNNER_TEMP}/train-guard-wheel/bin/train-guard" simulate \
             examples/power-trace.jsonl --config config.example.json --json > /dev/null
           "${RUNNER_TEMP}/train-guard-wheel/bin/train-guard" simulate \
