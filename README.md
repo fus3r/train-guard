@@ -1,5 +1,7 @@
 # train-guard
 
+![train-guard — Power-aware supervision for one long-running job.](https://raw.githubusercontent.com/fus3r/train-guard/c8f03a2da6a896d6b3bdd6f5a3a146a5796cf1cf/docs/assets/train-guard-banner.webp)
+
 Power-aware supervision for one long-running job.
 
 [![CI](https://github.com/fus3r/train-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/fus3r/train-guard/actions/workflows/ci.yml)
