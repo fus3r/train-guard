@@ -234,12 +234,12 @@ subprocess call. It is a development and CI artifact: wheels stay pure
 Python, `--engine python` is always available, and the packaged CLI
 works without any compiler.
 
-Nominal rows use the backwards-compatible `TGK 1` protocol. When bounds are
-requested and a kernel is available, the separate `TGS 1` protocol evaluates
-the same finite two-state envelope propagation for every policy. Python still
-computes the baseline envelope independently and refuses every native row if
-that baseline differs by one bit. The benchmark's `--sensitivity` mode compares
-all native candidate envelopes with Python.
+Nominal native rows use the backwards-compatible `TGK 1` protocol. When bounds
+are requested and engine selection chooses the kernel, the separate `TGS 1`
+protocol evaluates the same finite two-state envelope propagation for every
+policy. Python still computes the baseline envelope independently and refuses
+every native row if that baseline differs by one bit. The benchmark's
+`--sensitivity` mode compares all native candidate envelopes with Python.
 
 The kernel has the following correctness contract:
 
