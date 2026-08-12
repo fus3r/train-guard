@@ -1,6 +1,4 @@
-# train-guard
-
-_A training-job guard for laptops._
+![train-guard — Power-aware supervision for one long-running job.](docs/assets/train-guard-banner.webp)
 
 [![CI](https://github.com/fus3r/train-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/fus3r/train-guard/actions/workflows/ci.yml)
 
