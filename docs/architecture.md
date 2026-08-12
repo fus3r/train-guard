@@ -24,6 +24,9 @@ Trace JSONL -> SimulationRunner -> Observation -> PolicyEngine -> report
                                       |                 |
 Candidate config ---------------------+-----------------+-> comparison delta
 User bounds --------------------------+-> exact marginal envelopes and action margin
+
+Candidate grid -> SweepRunner -> PolicyEngine -> nominal Pareto report
+User bounds ----------+-> exact marginal envelopes -> interval-front enclosure
 ```
 
 There is one supervisor per named job. Each cycle follows the same sequence:
@@ -56,7 +59,7 @@ last piecewise-constant interval when a completed journal is replayed.
 | `simulation.py` | strict trace parsing and deterministic policy replay |
 | `robustness.py` | exact bounded objective sensitivity and minimum action-change distance |
 | `clairvoyant.py` | exact fractional exposure bounds for replayed policies |
-| `sweep.py` | candidate-grid evaluation, trace facts and Pareto reporting |
+| `sweep.py` | candidate-grid evaluation, trace facts, nominal Pareto reporting and interval-front enclosure |
 | `native.py` | discovery and checked protocol for the optional C++ replay kernel |
 | `platforms.py` | LaunchAgent, systemd and scheduled-task integration |
 | `supervisor.py` | lifecycle, signals, polling and recovery records |
@@ -236,6 +239,13 @@ envelopes and finds the minimum normalized in-box change that alters the
 complete action sequence. Neither replay path constructs the state directory.
 See [`replay-sensitivity.md`](replay-sensitivity.md) for the numeric contract and
 limits.
+
+The sweep reuses the objective-envelope pass for every candidate but omits the
+more expensive action-change margin. Its nominal rows may come from verified
+`TGK 1`; bounded rows stay on Python and are reported under a separate engine
+field. Worst-corner versus best-corner interval dominance can certify some
+policies as excluded, while overlapping boxes remain in a conservative outer
+enclosure rather than being labelled an exact robust Pareto set.
 
 ## Login restart
 

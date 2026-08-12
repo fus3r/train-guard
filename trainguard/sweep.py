@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 import json
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -29,6 +29,7 @@ if __package__:
     from .model import Action, DecisionReason, Observation, PowerSource
     from .native import KernelError, KernelRow, find_kernel, fnv1a_decisions, run_kernel
     from .policy import PolicyEngine
+    from .robustness import SensitivityBounds, SensitivityResult, analyze_sensitivity
     from .simulation import TraceError, _fingerprint, ordered_timestamps
 else:  # Keep direct CLI execution from a checkout working.
     from clairvoyant import (
@@ -43,6 +44,7 @@ else:  # Keep direct CLI execution from a checkout working.
     from config import ConfigError, PolicyConfig, policy_from_mapping
     from model import Action, DecisionReason, Observation, PowerSource
     from policy import PolicyEngine
+    from robustness import SensitivityBounds, SensitivityResult, analyze_sensitivity
     from simulation import TraceError, _fingerprint, ordered_timestamps
 
     from native import KernelError, KernelRow, find_kernel, fnv1a_decisions, run_kernel
@@ -310,6 +312,82 @@ def _pareto_flags(rows: Sequence[KernelRow]) -> list[bool]:
     return [point not in dominated for point in points]
 
 
+def _interval_front_flags(rows: Sequence[SensitivityResult]) -> list[bool]:
+    """Return a conservative frontier enclosure for interval objectives.
+
+    Candidate A certainly dominates B only when A's worst marginal bound is
+    no worse than B's best marginal bound on all three axes, with one strict
+    inequality. Transforming run time to a minimization coordinate makes this
+    an offline three-dimensional dominance query. Sorting that axis and
+    storing the lexicographically best remaining pair in a Fenwick tree gives
+    O(K log K) time.
+
+    Surviving candidates form an outer enclosure: overlapping objective boxes
+    are deliberately left unresolved because marginal extrema need not occur
+    on the same admissible trace.
+    """
+
+    if not rows:
+        return []
+
+    # Smaller is better on every transformed coordinate. Insert each policy's
+    # worst corner and query another policy's best corner.
+    points = [
+        (
+            -row.minimum_run_seconds,
+            row.maximum_hot_run_degc_seconds,
+            row.maximum_low_battery_run_seconds,
+        )
+        for row in rows
+    ]
+    queries = [
+        (
+            -row.maximum_run_seconds,
+            row.minimum_hot_run_degc_seconds,
+            row.minimum_low_battery_run_seconds,
+        )
+        for row in rows
+    ]
+    heat_values = sorted({point[1] for point in points})
+    tree: list[Optional[tuple[float, float, float]]] = [None] * (len(heat_values) + 1)
+
+    def update(index: int, value: tuple[float, float, float]) -> None:
+        while index < len(tree):
+            previous = tree[index]
+            if previous is None or value < previous:
+                tree[index] = value
+            index += index & -index
+
+    def prefix_best(index: int) -> Optional[tuple[float, float, float]]:
+        best: Optional[tuple[float, float, float]] = None
+        while index > 0:
+            value = tree[index]
+            if value is not None and (best is None or value < best):
+                best = value
+            index -= index & -index
+        return best
+
+    ordered_points = sorted(points)
+    ordered_queries = sorted(enumerate(queries), key=lambda item: item[1])
+    frontier = [True] * len(rows)
+    point_cursor = 0
+    for index, (query_run, query_hot, query_low) in ordered_queries:
+        while point_cursor < len(ordered_points) and ordered_points[point_cursor][0] <= query_run:
+            run, hot, low = ordered_points[point_cursor]
+            update(bisect_left(heat_values, hot) + 1, (low, run, hot))
+            point_cursor += 1
+
+        best = prefix_best(bisect_right(heat_values, query_hot))
+        if best is None:
+            continue
+        best_low, best_run, best_hot = best
+        if best_low <= query_low and (
+            best_low < query_low or best_run < query_run or best_hot < query_hot
+        ):
+            frontier[index] = False
+    return frontier
+
+
 def _candidate_report(
     overrides: dict[str, Any],
     policy: PolicyConfig,
@@ -321,11 +399,15 @@ def _candidate_report(
     low_frontier: CostFrontier,
     joint_frontier: JointCostFrontier,
     hot_ref_c: float,
+    sensitivity: Optional[SensitivityResult] = None,
+    interval_nondominated: Optional[bool] = None,
+    sensitivity_bounds: Optional[SensitivityBounds] = None,
+    low_battery_ref_pct: float = DEFAULT_LOW_BATTERY_REFERENCE_PCT,
 ) -> dict[str, Any]:
     def share(seconds: float) -> Optional[float]:
         return 100.0 * seconds / elapsed if elapsed > 0 else None
 
-    return {
+    report: dict[str, Any] = {
         "overrides": overrides,
         "policy": policy.to_dict(),
         "policy_sha256": _fingerprint(policy.to_dict()),
@@ -362,6 +444,16 @@ def _candidate_report(
             "action_transitions": (row.action_transitions - baseline_row.action_transitions),
         },
     }
+    if sensitivity is not None:
+        if sensitivity_bounds is None:
+            raise AssertionError("sensitivity results require their declared bounds")
+        report["sensitivity"] = sensitivity.to_dict(
+            sensitivity_bounds,
+            hot_ref_c=hot_ref_c,
+            low_battery_ref_pct=low_battery_ref_pct,
+        )
+        report["interval_nondominated"] = interval_nondominated
+    return report
 
 
 def run_sweep(
@@ -372,6 +464,7 @@ def run_sweep(
     engine: str = "auto",
     hot_ref_c: float = DEFAULT_HOT_REFERENCE_C,
     low_battery_ref_pct: float = DEFAULT_LOW_BATTERY_REFERENCE_PCT,
+    sensitivity: Optional[SensitivityBounds] = None,
 ) -> dict[str, Any]:
     """Evaluate a validated grid with Python or a verified native kernel."""
 
@@ -444,6 +537,25 @@ def run_sweep(
     low_frontier = build_frontier(low_rated)
     joint_frontier = build_joint_frontier(hot_rated, low_rated)
     flags = _pareto_flags(candidate_rows)
+
+    sensitivity_rows: Optional[list[SensitivityResult]] = None
+    interval_flags: list[Optional[bool]] = [None] * len(candidate_rows)
+    if sensitivity is not None:
+        # TGK 1 covers nominal replay only, so bounded objectives stay on the
+        # Python reference even when the nominal rows came from the kernel.
+        sensitivity_rows = [
+            analyze_sensitivity(
+                policy,
+                observations,
+                durations,
+                sensitivity,
+                hot_ref_c=hot_ref_c,
+                low_battery_ref_pct=low_battery_ref_pct,
+            )
+            for policy in policies
+        ]
+        interval_flags = list(_interval_front_flags(sensitivity_rows[1:]))
+
     reports = [
         _candidate_report(
             overrides,
@@ -456,11 +568,18 @@ def run_sweep(
             low_frontier,
             joint_frontier,
             hot_ref_c,
+            None if sensitivity_rows is None else sensitivity_rows[index + 1],
+            interval_nondominated,
+            sensitivity,
+            low_battery_ref_pct,
         )
-        for (overrides, policy), row, pareto in zip(candidates, candidate_rows, flags)
+        for index, ((overrides, policy), row, pareto, interval_nondominated) in enumerate(
+            zip(candidates, candidate_rows, flags, interval_flags)
+        )
     ]
     reports.sort(
         key=lambda item: (
+            sensitivity is not None and not item["interval_nondominated"],
             not item["pareto_optimal"],
             -item["metrics"]["run_seconds"],
             item["metrics"]["hot_run_degc_seconds"],
@@ -469,8 +588,8 @@ def run_sweep(
         )
     )
 
-    return {
-        "schema_version": 1,
+    report = {
+        "schema_version": 2 if sensitivity is not None else 1,
         "engine": engine_used,
         "kernel_verified_against_reference": kernel_verified,
         "hot_reference_c": hot_ref_c,
@@ -503,7 +622,23 @@ def run_sweep(
             low_frontier,
             joint_frontier,
             hot_ref_c,
+            None if sensitivity_rows is None else sensitivity_rows[0],
+            None,
+            sensitivity,
+            low_battery_ref_pct,
         ),
         "pareto_front_size": sum(flags),
         "candidates": reports,
     }
+    if sensitivity is not None:
+        report["uncertainty"] = {
+            "bounds": sensitivity.to_dict(),
+            "engine": "python",
+            "frontier_method": "marginal_interval_separation",
+            "frontier_guarantee": (
+                "excluded candidates are worse across their entire objective box; "
+                "survivors are a conservative outer enclosure, not an exact robust Pareto set"
+            ),
+        }
+        report["interval_front_size"] = sum(bool(flag) for flag in interval_flags)
+    return report

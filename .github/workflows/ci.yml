@@ -147,4 +147,5 @@ jobs:
             > "${RUNNER_TEMP}/sweep-grid.json"
           "${RUNNER_TEMP}/train-guard-wheel/bin/train-guard" sweep \
             examples/power-trace.jsonl --grid "${RUNNER_TEMP}/sweep-grid.json" \
-            --engine python --json > /dev/null
+            --engine python --temperature-uncertainty-c 0.5 \
+            --charge-uncertainty-pct 1 --json > /dev/null

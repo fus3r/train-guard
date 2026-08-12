@@ -9,8 +9,17 @@ import pytest
 from trainguard import cli
 from trainguard.config import ConfigError, PolicyConfig
 from trainguard.native import KernelRow
+from trainguard.robustness import SensitivityBounds, SensitivityResult
 from trainguard.simulation import load_trace
-from trainguard.sweep import SweepError, _pareto_flags, expand_grid, parse_grid, run_sweep
+from trainguard.sweep import (
+    SweepError,
+    _interval_front_flags,
+    _pareto_flags,
+    _python_rows,
+    expand_grid,
+    parse_grid,
+    run_sweep,
+)
 
 EXAMPLE_TRACE = Path(__file__).parents[1] / "examples" / "power-trace.jsonl"
 
@@ -112,6 +121,68 @@ def test_pareto_pass_matches_hand_checked_and_pairwise_oracles():
     assert _pareto_flags(randomized) == pairwise_oracle(randomized)
 
 
+def test_interval_front_matches_hand_checked_and_pairwise_oracles():
+    def row(
+        run_min: float,
+        run_max: float,
+        hot_min: float,
+        hot_max: float,
+        low_min: float,
+        low_max: float,
+    ) -> SensitivityResult:
+        return SensitivityResult(
+            run_min,
+            run_max,
+            hot_min,
+            hot_max,
+            low_min,
+            low_max,
+            0.0,
+            0.0,
+            0,
+            0,
+        )
+
+    def pairwise_oracle(rows: list[SensitivityResult]) -> list[bool]:
+        return [
+            not any(
+                other is not candidate
+                and other.minimum_run_seconds >= candidate.maximum_run_seconds
+                and other.maximum_hot_run_degc_seconds <= candidate.minimum_hot_run_degc_seconds
+                and other.maximum_low_battery_run_seconds
+                <= candidate.minimum_low_battery_run_seconds
+                and (
+                    other.minimum_run_seconds > candidate.maximum_run_seconds
+                    or other.maximum_hot_run_degc_seconds < candidate.minimum_hot_run_degc_seconds
+                    or other.maximum_low_battery_run_seconds
+                    < candidate.minimum_low_battery_run_seconds
+                )
+                for other in rows
+            )
+            for candidate in rows
+        ]
+
+    mixed = [
+        row(10, 12, 1, 2, 1, 2),  # dominates only boxes it clears worst-to-best
+        row(8, 9, 3, 4, 3, 4),  # dominated on every axis
+        row(13, 14, 4, 5, 1, 2),  # run/exposure trade-off
+        row(9, 11, 1.5, 2.5, 1.5, 2.5),  # overlap stays unresolved
+        row(10, 10, 2, 2, 2, 2),  # equality alone is not strict dominance
+        row(10, 10, 2, 2, 2, 2),  # duplicate stays co-optimal
+        row(9, 9, 2, 2, 2, 2),  # strict run-time loss is dominated
+    ]
+    assert _interval_front_flags(mixed) == [True, False, True, True, True, True, False]
+
+    rng = random.Random(0x1A7E2A1)
+    randomized = []
+    for _ in range(500):
+        lower = [float(rng.randrange(20)) for _ in range(3)]
+        upper = [value + float(rng.randrange(4)) for value in lower]
+        randomized.append(row(lower[0], upper[0], lower[1], upper[1], lower[2], upper[2]))
+    randomized.extend(mixed)
+    assert _interval_front_flags(randomized) == pairwise_oracle(randomized)
+
+
 def test_direct_policy_construction_enforces_sweep_invariants():
     with pytest.raises(ConfigError, match="temp_resume_c"):
         PolicyConfig(temp_resume_c=44, temp_pause_c=42)
@@ -135,6 +206,8 @@ def test_sweep_cli_is_offline_and_states_its_limitations(tmp_path, monkeypatch, 
         encoding="utf-8",
     )
     monkeypatch.setenv("TRAIN_GUARD_HOME", str(state_home))
+    monkeypatch.delenv("TRAIN_GUARD_KERNEL", raising=False)
+    monkeypatch.setattr("trainguard.sweep.find_kernel", lambda: None)
 
     assert (
         cli.main(
@@ -163,6 +236,38 @@ def test_sweep_cli_is_offline_and_states_its_limitations(tmp_path, monkeypatch, 
     assert payload["engine"] == "python"
     assert payload["candidates_evaluated"] == 4
     assert payload["baseline"]["clairvoyant"]["efficiency"] == 0.75
+    assert "uncertainty" not in payload
+    assert all("interval_nondominated" not in row for row in payload["candidates"])
+
+    bounds = [
+        "--temperature-uncertainty-c",
+        "0.5",
+        "--charge-uncertainty-pct",
+        "1",
+    ]
+    assert cli.main(["sweep", str(EXAMPLE_TRACE), "--grid", str(grid), *bounds]) == 0
+    bounded_output = capsys.readouterr().out
+    assert "conservative interval-front enclosure" in bounded_output
+    assert "not an exact robust Pareto set" in bounded_output
+
+    assert cli.main(["sweep", str(EXAMPLE_TRACE), "--grid", str(grid), *bounds, "--json"]) == 0
+    bounded = json.loads(capsys.readouterr().out)
+    assert bounded["schema_version"] == 2
+    assert bounded["engine"] == "python"
+    assert bounded["uncertainty"]["engine"] == "python"
+    assert bounded["uncertainty"]["frontier_method"] == "marginal_interval_separation"
+    assert bounded["interval_front_size"] == sum(
+        candidate["interval_nondominated"] for candidate in bounded["candidates"]
+    )
+    assert bounded["baseline"]["sensitivity"]["run_seconds"] == {
+        "minimum": 600.0,
+        "maximum": 1500.0,
+    }
+    assert all(
+        "action_change_margin" not in candidate["sensitivity"]
+        for candidate in bounded["candidates"]
+    )
+    assert not state_home.exists()
 
 
 def test_sweep_rejects_unavailable_or_invalid_engines(monkeypatch):
@@ -174,3 +279,29 @@ def test_sweep_rejects_unavailable_or_invalid_engines(monkeypatch):
     monkeypatch.setattr("trainguard.sweep.find_kernel", lambda: None)
     with pytest.raises(SweepError, match="engine=native requires"):
         run_sweep(PolicyConfig(), grid, observations, engine="native")
+
+    def nominal_kernel(_kernel, policies, kernel_observations, timestamps, **references):
+        durations = [
+            (timestamps[index + 1] - timestamps[index]).total_seconds()
+            for index in range(len(timestamps) - 1)
+        ] + [0.0]
+        return _python_rows(
+            policies,
+            kernel_observations,
+            durations,
+            hot_ref_c=references["hot_ref_c"],
+            low_battery_ref_pct=references["low_battery_ref_pct"],
+        )
+
+    monkeypatch.setattr("trainguard.sweep.find_kernel", lambda: Path("nominal-kernel"))
+    monkeypatch.setattr("trainguard.sweep.run_kernel", nominal_kernel)
+    bounded = run_sweep(
+        PolicyConfig(),
+        grid,
+        observations,
+        engine="native",
+        sensitivity=SensitivityBounds(temperature_c=0.5, charge_pct=1.0),
+    )
+    assert bounded["engine"] == "native"
+    assert bounded["kernel_verified_against_reference"] is True
+    assert bounded["uncertainty"]["engine"] == "python"

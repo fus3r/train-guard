@@ -97,7 +97,7 @@ recovery steps are in [`docs/failure-model.md`](docs/failure-model.md).
 | `list [--json]` | show a compact job list |
 | `events NAME [--limit N] [--json]` | read the structured event journal |
 | `simulate TRACE [--config FILE] [--compare-config FILE] [--temperature-uncertainty-c C] [--charge-uncertainty-pct P] [--json]` | replay, compare or bound policy sensitivity against observation or event JSONL |
-| `sweep TRACE --grid FILE [--config FILE] [--engine auto\|python\|native] [--json]` | evaluate a grid of candidate policies and report Pareto-optimal trade-offs |
+| `sweep TRACE --grid FILE [--config FILE] [--engine auto\|python\|native] [--temperature-uncertainty-c C] [--charge-uncertainty-pct P] [--json]` | evaluate nominal and bounded-uncertainty policy frontiers |
 | `stop NAME` | release owned process changes and detach |
 | `stop NAME --kill` | release owned changes, then terminate the process tree |
 | `recover NAME` | release changes recorded by a dead supervisor |
@@ -109,9 +109,10 @@ recovery steps are in [`docs/failure-model.md`](docs/failure-model.md).
 
 Run `train-guard COMMAND --help` for all options.
 
-`status --json`, `doctor --json` and nominal replay reports carry
-`schema_version: 1`. A sensitivity-enabled replay uses outer schema 3 and a
-nested schema-3 sensitivity report. `doctor` validates stored metadata, process
+`status --json`, `doctor --json`, nominal replay reports and nominal sweep
+reports carry `schema_version: 1`. A sensitivity-enabled replay uses outer
+schema 3 and nested sensitivity schema 3; a bounded sweep uses outer schema 2
+and nested sensitivity schema 2. `doctor` validates stored metadata, process
 identities, runtime JSON and login restart specifications in addition to
 checking sensors and stale supervisors.
 
@@ -202,6 +203,9 @@ interpretation. Method, schema and limitations are documented in
 ```bash
 train-guard sweep examples/power-trace.jsonl \
   --grid grid.json --config config.example.json
+train-guard sweep examples/power-trace.jsonl \
+  --grid grid.json --temperature-uncertainty-c 0.5 \
+  --charge-uncertainty-pct 1 --json
 ```
 
 where `grid.json` maps policy fields to candidate values, for example
@@ -211,6 +215,15 @@ same observations. Candidates are scored on permitted run time,
 degree-seconds above a reference temperature while running, and time
 running on a low battery, then marked Pareto-optimal when no other
 candidate does at least as well on all three axes and better on one.
+
+With either uncertainty option, every policy also receives exact marginal
+envelopes for the three objectives. A candidate is marked
+`interval_nondominated` unless another policy's worst objective corner
+dominates its best corner. Overlapping boxes remain unresolved, so survivors
+form a conservative outer enclosure rather than an exact robust Pareto set.
+The uncertainty pass uses Python even when `engine` is `native`; the report
+states this separately as `uncertainty.engine`. Sweep sensitivity deliberately
+omits the replay-only action-change margin.
 
 Each candidate also carries a clairvoyant efficiency: its permitted
 work divided by the exact optimum of a joint fractional schedule at the
@@ -247,6 +260,9 @@ MSVC on every push and re-runs that differential check. Wheels stay pure
 Python; without the kernel, `sweep` uses the same engine the live
 supervisor runs.
 
+`TGK 1` accelerates nominal rows only. Bounded sweep envelopes remain on the
+Python reference and do not cross the native protocol in this version.
+
 ```bash
 cmake -S native -B native/build && cmake --build native/build --config Release
 python tools/bench_sweep.py --kernel native/build/train-guard-kernel
@@ -265,6 +281,9 @@ After replay, Pareto dominance is computed in `O(N + U log U)` time for `N`
 candidate rows and `U` distinct metric triples. The Pareto benchmark checks a
 mixed hand-calculated corpus and an independent pairwise oracle before it
 reports hardware-specific timings; duplicates remain co-optimal.
+The bounded interval-separation pass is another exact `O(N log N)` dominance
+query; its deterministic test corpus includes dominated boxes, trade-offs,
+equalities, duplicates and overlaps.
 
 ## Platform behavior
 

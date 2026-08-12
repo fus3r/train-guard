@@ -56,6 +56,46 @@ bounded prefix against an independent pairwise oracle before timing an
 all-nondominated workload. Its timings describe only the printed Python,
 platform, point count and repeat count; they are not a CI threshold.
 
+## Bounded uncertainty and interval-front enclosure
+
+Nominal frontiers can change when a recorded temperature or charge lies near a
+policy threshold. The sweep therefore accepts the same user-declared closed
+half-widths as `simulate`:
+
+```bash
+train-guard sweep examples/power-trace.jsonl \
+  --grid my-grid.json \
+  --temperature-uncertainty-c 0.5 \
+  --charge-uncertainty-pct 1 --json
+```
+
+For each policy, the Python sensitivity pass propagates thermal cooldown and
+computes tight marginal intervals for run seconds, hot degree-seconds and
+low-battery run seconds. Bounds are adversarial rather than probabilistic:
+Train Guard does not infer sensor accuracy or report a confidence level. The
+sweep does not compute the replay-only action-change margin. Details of the
+finite binary64 model are in [`replay-sensitivity.md`](replay-sensitivity.md).
+
+The report also marks each candidate as `interval_nondominated`. A policy is
+excluded only if another policy's worst objective corner dominates its best
+corner on all three axes, with at least one strict inequality. Overlapping
+boxes therefore remain incomparable. Survivors are a conservative outer
+enclosure, not an exact robust Pareto set, because marginal extrema need not
+come from the same admissible trace.
+
+The interval pass transforms runnable time into a minimization coordinate,
+sorts the run bounds and uses a Fenwick prefix minimum over compressed heat
+bounds. It computes the separation rule exactly in `O(K log K)` time and
+`O(K)` memory. A deterministic independent pairwise oracle checks dominated
+boxes, trade-offs, equality boundaries, duplicates and overlaps.
+
+Without bounds, the report remains schema 1 and preserves the nominal ranking.
+With bounds, it uses schema 2, adds each policy's `sensitivity` object and
+reports `interval_front_size`. The top-level `engine` still names the nominal
+row engine. `uncertainty.engine` is `python` even when the optional `TGK 1`
+kernel produced the nominal rows; bounded values do not cross the native
+protocol in this version.
+
 ## Reading the numbers honestly
 
 The metrics are exposure re-weightings of a recorded trace, not simulated

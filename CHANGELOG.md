@@ -12,6 +12,9 @@
 - Report the minimum normalized binary64 distance to an action-sequence change,
   and expose both analyses through optional `simulate` flags and schema 3 while
   preserving nominal schema 1.
+- Extend `sweep` with Python bounded-objective envelopes and an exact
+  `O(N log N)` interval-separation pass. Bounded reports use schema 2 and a
+  conservative outer frontier enclosure; nominal reports remain schema 1.
 
 ## 0.3.0 - 2026-08-08
 

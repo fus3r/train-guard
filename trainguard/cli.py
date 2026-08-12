@@ -1056,6 +1056,16 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         raise StateError(f"{grid_path}: cannot read grid: {exc}") from exc
     grid = parse_grid(grid_text, str(grid_path))
     observations = load_trace(trace_path)
+    sensitivity = None
+    if args.temperature_uncertainty_c is not None or args.charge_uncertainty_pct is not None:
+        sensitivity = SensitivityBounds(
+            temperature_c=(
+                0.0 if args.temperature_uncertainty_c is None else args.temperature_uncertainty_c
+            ),
+            charge_pct=(
+                0.0 if args.charge_uncertainty_pct is None else args.charge_uncertainty_pct
+            ),
+        )
     report = run_sweep(
         base,
         grid,
@@ -1063,6 +1073,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         engine=args.engine,
         hot_ref_c=args.hot_ref,
         low_battery_ref_pct=args.low_battery_ref,
+        sensitivity=sensitivity,
     )
     report["trace"] = str(trace_path)
     report["config_source"] = str(config_path) if config_path.exists() else "defaults"
@@ -1098,6 +1109,14 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         f"{report['candidates_rejected']} invalid, "
         f"pareto front {report['pareto_front_size']}"
     )
+    if sensitivity is not None:
+        print(
+            "bounded uncertainty: "
+            f"temperature +/-{sensitivity.temperature_c:g}C, "
+            f"charge +/-{sensitivity.charge_pct:g} points; "
+            f"conservative interval-front enclosure {report['interval_front_size']}; "
+            "no confidence level"
+        )
     baseline = report["baseline"]["metrics"]
     print(
         f"baseline: run {baseline['run_seconds']:g}s  "
@@ -1118,14 +1137,20 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         f"(efficiency {efficiency_text(bound['efficiency'])}, "
         f"gap {bound['gap_seconds']:g}s, hot-only cutoff {threshold_text})"
     )
-    print("   run_s     hot_degC*s  lowbatt_s  trans   eff  overrides")
+    if sensitivity is None:
+        print("   run_s     hot_degC*s  lowbatt_s  trans   eff  overrides")
+    else:
+        print(" I* run_s     hot_degC*s  lowbatt_s  trans   eff  overrides")
     for candidate in report["candidates"][: args.top]:
         metrics = candidate["metrics"]
+        interval_marker = ""
+        if sensitivity is not None:
+            interval_marker = "I" if candidate["interval_nondominated"] else " "
         marker = "*" if candidate["pareto_optimal"] else " "
         overrides = json.dumps(candidate["overrides"], sort_keys=True)
         efficiency = efficiency_text(candidate["clairvoyant"]["efficiency"])
         print(
-            f" {marker} {metrics['run_seconds']:>7g}  "
+            f" {interval_marker}{marker} {metrics['run_seconds']:>7g}  "
             f"{metrics['hot_run_degc_seconds']:>10g}  "
             f"{metrics['low_battery_run_seconds']:>9g}  "
             f"{metrics['action_transitions']:>5}  {efficiency:>4}  {overrides}"
@@ -1134,6 +1159,12 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     if remaining > 0:
         print(f"  ... {remaining} more; use --json for the complete report")
     print("* pareto-optimal on (run seconds up, hot exposure down, low-battery run down)")
+    if sensitivity is not None:
+        print(
+            "I interval-nondominated under the declared bounds; this is a conservative "
+            "frontier enclosure, not an exact robust Pareto set, because overlapping "
+            "objective boxes remain unresolved"
+        )
     print(
         "note: metrics re-weight the recorded trace under each policy's "
         "actions; they do not simulate temperature or charge and are not "
@@ -1516,6 +1547,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="candidate rows in human output (default: 10)",
+    )
+    sweep.add_argument(
+        "--temperature-uncertainty-c",
+        type=float,
+        help="closed temperature half-width for bounded interval-front analysis",
+    )
+    sweep.add_argument(
+        "--charge-uncertainty-pct",
+        type=float,
+        help="closed charge-percentage half-width for bounded interval-front analysis",
     )
     sweep.add_argument("--json", action="store_true")
     sweep.set_defaults(fn=cmd_sweep)
