@@ -96,7 +96,7 @@ recovery steps are in [`docs/failure-model.md`](docs/failure-model.md).
 | `status [--json]` | show sensors, policy, supervisors and restart specs |
 | `list [--json]` | show a compact job list |
 | `events NAME [--limit N] [--json]` | read the structured event journal |
-| `simulate TRACE [--config FILE] [--compare-config FILE] [--json]` | replay or compare policies against observation or event JSONL |
+| `simulate TRACE [--config FILE] [--compare-config FILE] [--temperature-uncertainty-c C] [--charge-uncertainty-pct P] [--json]` | replay, compare or bound policy sensitivity against observation or event JSONL |
 | `sweep TRACE --grid FILE [--config FILE] [--engine auto\|python\|native] [--json]` | evaluate a grid of candidate policies and report Pareto-optimal trade-offs |
 | `stop NAME` | release owned process changes and detach |
 | `stop NAME --kill` | release owned changes, then terminate the process tree |
@@ -109,10 +109,11 @@ recovery steps are in [`docs/failure-model.md`](docs/failure-model.md).
 
 Run `train-guard COMMAND --help` for all options.
 
-`status --json`, `doctor --json` and replay reports carry
-`schema_version: 1`. `doctor` validates stored metadata, process identities,
-runtime JSON and login restart specifications in addition to checking sensors
-and stale supervisors.
+`status --json`, `doctor --json` and nominal replay reports carry
+`schema_version: 1`. A sensitivity-enabled replay uses outer schema 3 and a
+nested schema-3 sensitivity report. `doctor` validates stored metadata, process
+identities, runtime JSON and login restart specifications in addition to
+checking sensors and stale supervisors.
 
 ## Policy
 
@@ -159,6 +160,9 @@ train-guard simulate ~/.train-guard/logs/experiment.events.jsonl --json
 train-guard simulate examples/power-trace.jsonl \
   --config config.example.json \
   --compare-config examples/battery-enabled-policy.json
+train-guard simulate examples/power-trace.jsonl \
+  --temperature-uncertainty-c 0.5 \
+  --charge-uncertainty-pct 1 --json
 ```
 
 The example trace covers normal AC work, warm charging, thermal hysteresis and
@@ -182,6 +186,14 @@ reports candidate-minus-baseline seconds, percentage points, transition deltas
 and every decision disagreement. Reports embed canonical SHA-256 fingerprints
 of the validated policies and observations; these identify replay inputs, not
 measured battery or throughput gains.
+
+The optional uncertainty flags compute exact bounded-adversarial marginal
+envelopes for runnable time, hot exposure and low-battery exposure while
+propagating thermal cooldown. They also report the minimum normalized distance
+to an admitted trace with a different action sequence and its first divergence
+context. The user supplies the bounds; the report has no confidence or causal
+interpretation. Method, schema and limitations are documented in
+[`docs/replay-sensitivity.md`](docs/replay-sensitivity.md).
 
 ## Policy sweep
 

@@ -96,6 +96,7 @@ jobs:
               "docs/failure-model.md",
               "docs/policy-replay.md",
               "docs/policy-sweep.md",
+              "docs/replay-sensitivity.md",
               "examples/power-trace.jsonl",
               "legacy/macos-shell/train-guard.sh",
               "native/CMakeLists.txt",
@@ -138,6 +139,10 @@ jobs:
           "${RUNNER_TEMP}/train-guard-wheel/bin/train-guard" simulate \
             examples/power-trace.jsonl --config config.example.json \
             --compare-config examples/battery-enabled-policy.json --json > /dev/null
+          "${RUNNER_TEMP}/train-guard-wheel/bin/train-guard" simulate \
+            examples/power-trace.jsonl --config config.example.json \
+            --temperature-uncertainty-c 0.5 --charge-uncertainty-pct 1 \
+            --json > /dev/null
           printf '{"temp_pause_c": [40, 42, 44], "run_on_battery": [true, false]}' \
             > "${RUNNER_TEMP}/sweep-grid.json"
           "${RUNNER_TEMP}/train-guard-wheel/bin/train-guard" sweep \

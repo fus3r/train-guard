@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import itertools
+import json
 import math
+from pathlib import Path
 
 import pytest
 
+from trainguard import cli
 from trainguard.config import PolicyConfig
 from trainguard.model import Action, Observation, PowerSource
 from trainguard.policy import PolicyEngine
@@ -14,6 +17,8 @@ from trainguard.robustness import (
     analyze_sensitivity,
     analyze_sensitivity_with_margin,
 )
+
+EXAMPLE_TRACE = Path(__file__).parents[1] / "examples" / "power-trace.jsonl"
 
 
 def _observation(second: int, temperature: float | None) -> Observation:
@@ -358,3 +363,89 @@ def test_action_change_margin_matches_independent_tiny_trace_enumeration():
         SensitivityBounds(temperature_c=temperature_width),
     )
     assert margin.minimum_normalized_action_distance == min(brute_force_distances)
+
+
+def test_simulate_cli_exposes_bounded_replay_without_creating_state(tmp_path, monkeypatch, capsys):
+    state_home = tmp_path / "must-not-be-created"
+    candidate = tmp_path / "candidate.json"
+    candidate.write_text('{"run_on_battery": true}', encoding="utf-8")
+    monkeypatch.setenv("TRAIN_GUARD_HOME", str(state_home))
+
+    flags = [
+        "--temperature-uncertainty-c",
+        "0.5",
+        "--charge-uncertainty-pct",
+        "1",
+    ]
+    assert cli.main(["simulate", str(EXAMPLE_TRACE), *flags, "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema_version"] == 3
+    assert report["action_seconds"] == {"full": 600.0, "gentle": 300.0, "stop": 900.0}
+    sensitivity = report["sensitivity"]
+    assert sensitivity["schema_version"] == 3
+    assert sensitivity["bounds"] == {
+        "model": "bounded_adversarial",
+        "numeric_domain": "ieee_754_binary64",
+        "temperature_half_width_c": 0.5,
+        "charge_half_width_pct": 1.0,
+        "confidence_level": None,
+        "missing_measurements": "remain_missing",
+        "uncertainty_set": "cartesian_product",
+        "temporal_correlation": "unmodeled",
+    }
+    assert sensitivity["run_seconds"] == {"minimum": 600.0, "maximum": 1500.0}
+    assert sensitivity["hot_run_degc_seconds"] == {
+        "minimum": 150.0,
+        "maximum": 4349.999999999998,
+        "reference_c": 35.0,
+    }
+    assert sensitivity["action_change_margin"] == {
+        "model": "bounded_minimum_distortion",
+        "metric": "normalized_linf",
+        "numeric_domain": "ieee_754_binary64",
+        "minimum_normalized_action_distance": math.ulp(80.0),
+        "minimum_normalized_action_distance_hex": "0x1.0000000000000p-46",
+        "stable_for_declared_box": False,
+        "critical_sample": {
+            "sample": 3,
+            "observed_at": "2026-07-26T09:10:00Z",
+            "nominal_action": "stop",
+            "alternative_action": "gentle",
+        },
+    }
+
+    assert (
+        cli.main(
+            [
+                "simulate",
+                str(EXAMPLE_TRACE),
+                "--compare-config",
+                str(candidate),
+                *flags,
+                "--json",
+            ]
+        )
+        == 0
+    )
+    comparison = json.loads(capsys.readouterr().out)
+    assert comparison["schema_version"] == 3
+    assert comparison["baseline"]["sensitivity"]["bounds"] == sensitivity["bounds"]
+    assert comparison["candidate"]["sensitivity"]["bounds"] == sensitivity["bounds"]
+    assert comparison["delta"]["action_seconds"]["stop"] == -300.0
+
+    assert cli.main(["simulate", str(EXAMPLE_TRACE), *flags]) == 0
+    assert "no confidence level" in capsys.readouterr().out
+
+    assert (
+        cli.main(
+            [
+                "simulate",
+                str(EXAMPLE_TRACE),
+                "--temperature-uncertainty-c",
+                "-1",
+            ]
+        )
+        == 2
+    )
+    assert "finite half-width" in capsys.readouterr().err
+    assert not state_home.exists()

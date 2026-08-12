@@ -15,10 +15,12 @@ if __package__:
     from .config import PolicyConfig
     from .model import Action, Observation, PowerSource
     from .policy import PolicyEngine
+    from .robustness import SensitivityBounds, analyze_sensitivity_with_margin
 else:  # Keep direct CLI execution from a checkout working.
     from config import PolicyConfig
     from model import Action, Observation, PowerSource
     from policy import PolicyEngine
+    from robustness import SensitivityBounds, analyze_sensitivity_with_margin
 
 
 _OBSERVATION_KEYS = frozenset(
@@ -208,12 +210,18 @@ def _fingerprint(value: Any) -> str:
 def simulate_policy(
     config: PolicyConfig,
     observations: Sequence[Observation],
+    *,
+    sensitivity: Optional[SensitivityBounds] = None,
 ) -> dict[str, Any]:
     """Replay one policy and return sample- and time-weighted results."""
 
     if not observations:
         raise TraceError("cannot simulate an empty trace")
     timestamps = ordered_timestamps(observations)
+    durations = [0.0] * len(observations)
+    for index in range(len(observations) - 1):
+        durations[index] = (timestamps[index + 1] - timestamps[index]).total_seconds()
+
     engine = PolicyEngine()
     action_samples: Counter[str] = Counter()
     reason_samples: Counter[str] = Counter()
@@ -232,10 +240,8 @@ def simulate_policy(
         action_samples[action] += 1
         reason_samples[reason] += 1
 
-        duration = 0.0
-        if index + 1 < len(timestamps):
-            duration = (timestamps[index + 1] - timestamps[index]).total_seconds()
-            action_seconds[action] += duration
+        duration = durations[index]
+        action_seconds[action] += duration
         record = {
             "sample": index + 1,
             "observed_at": observation.observed_at,
@@ -262,7 +268,7 @@ def simulate_policy(
         action.value: (100.0 * action_seconds[action.value] / elapsed if elapsed > 0 else None)
         for action in Action
     }
-    return {
+    report: dict[str, Any] = {
         "schema_version": 1,
         "policy": config.to_dict(),
         "policy_sha256": _fingerprint(config.to_dict()),
@@ -282,17 +288,32 @@ def simulate_policy(
         "transitions": transitions,
         "decisions": decisions,
     }
+    if sensitivity is not None:
+        result, action_margin = analyze_sensitivity_with_margin(
+            config,
+            observations,
+            durations,
+            sensitivity,
+        )
+        report["schema_version"] = 3
+        report["sensitivity"] = result.to_dict(
+            sensitivity,
+            action_change_margin=action_margin,
+        )
+    return report
 
 
 def compare_policies(
     baseline_config: PolicyConfig,
     candidate_config: PolicyConfig,
     observations: Sequence[Observation],
+    *,
+    sensitivity: Optional[SensitivityBounds] = None,
 ) -> dict[str, Any]:
     """Replay two policies on the same observations and quantify differences."""
 
-    baseline = simulate_policy(baseline_config, observations)
-    candidate = simulate_policy(candidate_config, observations)
+    baseline = simulate_policy(baseline_config, observations, sensitivity=sensitivity)
+    candidate = simulate_policy(candidate_config, observations, sensitivity=sensitivity)
     disagreements: list[dict[str, Any]] = []
     action_disagreement_samples = 0
     action_disagreement_seconds = 0.0
@@ -322,7 +343,7 @@ def compare_policies(
 
     elapsed = float(baseline["elapsed_seconds"])
     return {
-        "schema_version": 1,
+        "schema_version": 3 if sensitivity is not None else 1,
         "baseline": baseline,
         "candidate": candidate,
         "delta": {

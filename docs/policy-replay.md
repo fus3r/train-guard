@@ -112,13 +112,30 @@ points, transition-count deltas, action-disagreement duration, and the rows
 whose decisions differ. It does not estimate energy, temperature or model
 throughput.
 
+Bound the effect of user-supplied measurement intervals:
+
+```bash
+train-guard simulate examples/power-trace.jsonl \
+  --config config.example.json \
+  --temperature-uncertainty-c 0.5 \
+  --charge-uncertainty-pct 1 --json
+```
+
+This computes tight marginal objective envelopes while preserving thermal
+hysteresis, marks locally ambiguous action time and reports the nearest
+normalized in-box action divergence. It does not infer sensor error or a
+probability distribution. See
+[`replay-sensitivity.md`](replay-sensitivity.md) for the method, schema and
+assumptions.
+
 Human output lists at most 20 decision transitions by default. Change that
 display limit with `--transition-limit`; JSON output always contains every
 decision and transition.
 
 ## Report contract
 
-The JSON report has `schema_version: 1` and includes:
+Without sensitivity options, the JSON report has `schema_version: 1` and
+includes:
 
 - the complete validated policy used for replay;
 - canonical SHA-256 fingerprints of the policy and parsed observations;
@@ -139,6 +156,12 @@ the trace.
 Comparison JSON has its own `schema_version: 1`, contains complete baseline and
 candidate replay reports, and adds a `delta` object plus transition-level
 `disagreements`.
+
+When either sensitivity option is supplied, replay and comparison use outer
+`schema_version: 3`. Each replay contains a nested, independently versioned
+schema-3 `sensitivity` report with objective envelopes, action stability and
+critical action-divergence context. Existing nominal fields retain their
+schema-1 meanings.
 
 ## Included example
 

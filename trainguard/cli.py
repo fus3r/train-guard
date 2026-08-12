@@ -44,6 +44,7 @@ if __package__:
         is_guard_process,
         process_identity,
     )
+    from .robustness import SensitivityBounds, SensitivityError
     from .sensors import SensorReader
     from .simulation import TraceError, compare_policies, load_trace, simulate_policy
     from .state import (
@@ -80,6 +81,7 @@ else:  # Keep direct execution from a checkout working.
         is_guard_process,
         process_identity,
     )
+    from robustness import SensitivityBounds, SensitivityError
     from sensors import SensorReader
     from simulation import TraceError, compare_policies, load_trace, simulate_policy
     from state import (
@@ -399,6 +401,19 @@ def _policy_line(cfg: PolicyConfig) -> str:
         else f"{cfg.battery_band} (floor {cfg.battery_floor_pct:g}%)"
     )
     return f"AC={cfg.ac_band}  battery={batt}"
+
+
+def _action_margin_line(envelope: dict[str, Any]) -> str:
+    margin = envelope["action_change_margin"]
+    distance = margin["minimum_normalized_action_distance"]
+    if distance is None:
+        return "action sequence stable throughout the declared box"
+    critical = margin["critical_sample"]
+    return (
+        f"nearest action change distance {distance:.6g} at sample "
+        f"{critical['sample']} ({critical['nominal_action']} -> "
+        f"{critical['alternative_action']})"
+    )
 
 
 def _restart_on_login(args: argparse.Namespace) -> bool:
@@ -890,12 +905,23 @@ def cmd_simulate(args: argparse.Namespace) -> int:
 
     policy = load_policy(config_path)
     observations = load_trace(trace_path)
+    sensitivity = None
+    if args.temperature_uncertainty_c is not None or args.charge_uncertainty_pct is not None:
+        sensitivity = SensitivityBounds(
+            temperature_c=args.temperature_uncertainty_c or 0.0,
+            charge_pct=args.charge_uncertainty_pct or 0.0,
+        )
     if args.compare_config_path:
         candidate_path = Path(args.compare_config_path).expanduser().resolve()
         if not candidate_path.is_file():
             raise StateError(f"comparison configuration file does not exist: {candidate_path}")
         candidate = load_policy(candidate_path)
-        comparison = compare_policies(policy, candidate, observations)
+        comparison = compare_policies(
+            policy,
+            candidate,
+            observations,
+            sensitivity=sensitivity,
+        )
         comparison["trace"] = str(trace_path)
         comparison["baseline_config_source"] = (
             str(config_path) if config_path.exists() else "defaults"
@@ -931,6 +957,21 @@ def cmd_simulate(args: argparse.Namespace) -> int:
             f"transition delta: {delta['action_transitions']:+d} action, "
             f"{delta['decision_transitions']:+d} decision"
         )
+        if sensitivity is not None:
+            print(
+                "bounded sensitivity: "
+                f"temperature +/-{sensitivity.temperature_c:g}C, "
+                f"charge +/-{sensitivity.charge_pct:g} points; no confidence level"
+            )
+            for label in ("baseline", "candidate"):
+                envelope = comparison[label]["sensitivity"]
+                run = envelope["run_seconds"]
+                stability = envelope["action_stability"]
+                print(
+                    f"  {label:<9} runnable {run['minimum']:g}..{run['maximum']:g}s, "
+                    f"ambiguous action {stability['ambiguous_seconds']:g}s"
+                )
+                print(f"             {_action_margin_line(envelope)}")
         for record in comparison["disagreements"][: args.transition_limit]:
             baseline_decision = record["baseline"]
             candidate_decision = record["candidate"]
@@ -944,7 +985,7 @@ def cmd_simulate(args: argparse.Namespace) -> int:
             print(f"  ... {remaining} more; use --json for the complete comparison")
         return 0
 
-    report = simulate_policy(policy, observations)
+    report = simulate_policy(policy, observations, sensitivity=sensitivity)
     report["trace"] = str(trace_path)
     report["config_source"] = str(config_path) if config_path.exists() else "defaults"
     if args.json:
@@ -962,6 +1003,18 @@ def cmd_simulate(args: argparse.Namespace) -> int:
         share = "n/a" if percent is None else f"{percent:.1f}%"
         samples = report["action_samples"][action.value]
         print(f"  {action.value:<7} {seconds:>8g}s  {share:>6}  {samples} samples")
+    if sensitivity is not None:
+        envelope = report["sensitivity"]
+        run = envelope["run_seconds"]
+        stability = envelope["action_stability"]
+        print(
+            "bounded sensitivity: "
+            f"temperature +/-{sensitivity.temperature_c:g}C, "
+            f"charge +/-{sensitivity.charge_pct:g} points; "
+            f"runnable {run['minimum']:g}..{run['maximum']:g}s, "
+            f"ambiguous action {stability['ambiguous_seconds']:g}s; no confidence level"
+        )
+        print(f"  {_action_margin_line(envelope)}")
     print(
         f"transitions: {report['action_transitions']} action, "
         f"{report['decision_transitions']} decision"
@@ -1414,6 +1467,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="maximum transition rows in human output (default: 20)",
     )
+    simulate.add_argument(
+        "--temperature-uncertainty-c",
+        type=float,
+        help="closed temperature half-width for exact bounded sensitivity (no default)",
+    )
+    simulate.add_argument(
+        "--charge-uncertainty-pct",
+        type=float,
+        help="closed charge-percentage half-width for exact bounded sensitivity (no default)",
+    )
     simulate.add_argument("--json", action="store_true")
     simulate.set_defaults(fn=cmd_simulate)
 
@@ -1498,6 +1561,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ConfigError,
         OSError,
         PlatformError,
+        SensitivityError,
         StateError,
         SweepError,
         TraceError,

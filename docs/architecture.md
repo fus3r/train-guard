@@ -23,6 +23,7 @@ Supervisor -> SensorReader -> Observation -> PolicyEngine -> PolicyDecision
 Trace JSONL -> SimulationRunner -> Observation -> PolicyEngine -> report
                                       |                 |
 Candidate config ---------------------+-----------------+-> comparison delta
+User bounds --------------------------+-> exact marginal envelopes and action margin
 ```
 
 There is one supervisor per named job. Each cycle follows the same sequence:
@@ -53,6 +54,7 @@ last piecewise-constant interval when a completed journal is replayed.
 | `state.py` | validated names, schemas and atomic JSON state |
 | `journal.py` | JSON Lines and readable text events |
 | `simulation.py` | strict trace parsing and deterministic policy replay |
+| `robustness.py` | exact bounded objective sensitivity and minimum action-change distance |
 | `clairvoyant.py` | exact fractional exposure bounds for replayed policies |
 | `sweep.py` | candidate-grid evaluation, trace facts and Pareto reporting |
 | `native.py` | discovery and checked protocol for the optional C++ replay kernel |
@@ -226,6 +228,14 @@ With `--compare-config`, the runner evaluates a baseline and candidate against
 the same sequence and reports time-weighted action deltas and disagreements.
 Canonical policy and observation fingerprints make two saved reports
 auditable without treating a file path as provenance.
+
+Optional user-supplied temperature and charge half-widths run a separate exact
+binary64 sensitivity pass over the replay's existing interval durations. Its
+dynamic program propagates thermal cooldown, returns tight marginal objective
+envelopes and finds the minimum normalized in-box change that alters the
+complete action sequence. Neither replay path constructs the state directory.
+See [`replay-sensitivity.md`](replay-sensitivity.md) for the numeric contract and
+limits.
 
 ## Login restart
 

@@ -6,6 +6,12 @@
   `O(N + U log U)` dominance pass while preserving duplicate and tie behavior.
 - Add a reproducible adversarial benchmark checked against a hand-calculated
   corpus and an independent bounded pairwise oracle.
+- Add exact bounded-adversarial replay sensitivity over user-supplied
+  temperature and charge intervals, including thermal-cooldown propagation and
+  tight marginal objective envelopes.
+- Report the minimum normalized binary64 distance to an action-sequence change,
+  and expose both analyses through optional `simulate` flags and schema 3 while
+  preserving nominal schema 1.
 
 ## 0.3.0 - 2026-08-08
 
