@@ -105,6 +105,7 @@ jobs:
               "tests/test_e2e.py",
               "tests/test_native.py",
               "tests/test_robustness.py",
+              "tools/bench_action_margin.py",
               "tools/bench_pareto.py",
               "tools/bench_sweep.py",
           )

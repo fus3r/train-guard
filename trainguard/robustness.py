@@ -73,6 +73,46 @@ class SensitivityBounds:
 
 
 @dataclass(frozen=True)
+class ActionChangeMargin:
+    """Nearest action-changing representative path in the declared binary64 box."""
+
+    minimum_normalized_action_distance: Optional[float]
+    critical_sample: Optional[int] = None
+    observed_at: Optional[str] = None
+    nominal_action: Optional[Action] = None
+    alternative_action: Optional[Action] = None
+
+    def to_dict(self) -> dict[str, object]:
+        critical = None
+        if self.critical_sample is not None:
+            if (
+                self.observed_at is None
+                or self.nominal_action is None
+                or self.alternative_action is None
+            ):
+                raise AssertionError("a critical sample requires complete action-change context")
+            critical = {
+                "sample": self.critical_sample,
+                "observed_at": self.observed_at,
+                "nominal_action": self.nominal_action.value,
+                "alternative_action": self.alternative_action.value,
+            }
+        return {
+            "model": "bounded_minimum_distortion",
+            "metric": "normalized_linf",
+            "numeric_domain": "ieee_754_binary64",
+            "minimum_normalized_action_distance": self.minimum_normalized_action_distance,
+            "minimum_normalized_action_distance_hex": (
+                None
+                if self.minimum_normalized_action_distance is None
+                else self.minimum_normalized_action_distance.hex()
+            ),
+            "stable_for_declared_box": self.minimum_normalized_action_distance is None,
+            "critical_sample": critical,
+        }
+
+
+@dataclass(frozen=True)
 class SensitivityResult:
     """Tight marginal objective envelopes and action stability for one policy."""
 
@@ -93,9 +133,10 @@ class SensitivityResult:
         *,
         hot_ref_c: float = 35.0,
         low_battery_ref_pct: float = 20.0,
+        action_change_margin: Optional[ActionChangeMargin] = None,
     ) -> dict[str, object]:
         elapsed = self.action_stable_seconds + self.action_ambiguous_seconds
-        return {
+        report: dict[str, object] = {
             "schema_version": 2,
             "bounds": bounds.to_dict(),
             "run_seconds": {
@@ -122,6 +163,10 @@ class SensitivityResult:
                 "ambiguous_samples": self.action_ambiguous_samples,
             },
         }
+        if action_change_margin is not None:
+            report["schema_version"] = 3
+            report["action_change_margin"] = action_change_margin.to_dict()
+        return report
 
 
 @dataclass(frozen=True)
@@ -134,6 +179,7 @@ class _TransitionEnvelope:
     maximum_hot_rate: float
     minimum_low_battery_rate: float
     maximum_low_battery_rate: float
+    minimum_action_distance: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -155,13 +201,17 @@ def _representatives(
     *,
     lower_bound: float,
     upper_bound: float,
+    include_endpoints: bool = True,
+    include_recorded: bool = False,
 ) -> tuple[Optional[float], ...]:
     if value is None:
         return (None,)
 
     low = max(lower_bound, float(value) - half_width)
     high = min(upper_bound, float(value) + half_width)
-    points = {low, high}
+    points = {low, high} if include_endpoints else set()
+    if include_recorded:
+        points.add(value)
     for threshold in thresholds:
         if low <= threshold <= high:
             points.add(threshold)
@@ -174,6 +224,30 @@ def _representatives(
     return tuple(sorted(points))
 
 
+def _normalized_axis_distance(
+    recorded: Optional[float],
+    candidate: Optional[float],
+    half_width: float,
+) -> float:
+    """Return the documented binary64 distance on one admitted box axis.
+
+    The full interval is constructed with binary64 ``recorded +/- half_width``.
+    That rounded endpoint can be microscopically farther than ``half_width``
+    under a second subtraction. Saturating an already-admitted endpoint at
+    one keeps the metric consistent with the sensitivity box it summarizes.
+    """
+
+    if recorded is None or candidate is None:
+        if recorded is not candidate:
+            raise AssertionError("bounded sensitivity cannot invent a missing value")
+        return 0.0
+    if candidate == recorded:
+        return 0.0
+    if half_width == 0.0:
+        raise AssertionError("a zero-width axis cannot contain another value")
+    return min(1.0, abs(candidate - recorded) / half_width)
+
+
 def _possible_transitions(
     config: PolicyConfig,
     observation: Observation,
@@ -182,6 +256,7 @@ def _possible_transitions(
     *,
     hot_ref_c: float,
     low_battery_ref_pct: float,
+    track_action_distance: bool = False,
 ) -> tuple[_TransitionEnvelope, ...]:
     temperatures = _representatives(
         observation.temperature_c,
@@ -207,10 +282,41 @@ def _possible_transitions(
         lower_bound=0.0,
         upper_bound=100.0,
     )
+    if track_action_distance:
+        action_temperatures = _representatives(
+            observation.temperature_c,
+            bounds.temperature_c,
+            (
+                config.temp_resume_c,
+                config.temp_pause_c,
+                config.temp_charge_gentle_c,
+                config.temp_gentle_c,
+            ),
+            lower_bound=-100.0,
+            upper_bound=200.0,
+            include_endpoints=False,
+            include_recorded=True,
+        )
+        action_percentages = _representatives(
+            observation.percent,
+            bounds.charge_pct,
+            (
+                config.battery_floor_pct,
+                config.charge_cool_until_pct,
+            ),
+            lower_bound=0.0,
+            upper_bound=100.0,
+            include_endpoints=False,
+            include_recorded=True,
+        )
+    else:
+        action_temperatures = ()
+        action_percentages = ()
 
     # (action, next cooling) -> [min hot rate, max hot rate,
     #                            min low-battery rate, max low-battery rate]
     outcomes: dict[tuple[Action, bool], list[float]] = {}
+    action_distances: dict[tuple[Action, bool], float] = {}
     for temperature in temperatures:
         for percent in percentages:
             perturbed = Observation(
@@ -244,6 +350,34 @@ def _possible_transitions(
                 previous[2] = min(previous[2], low_battery_rate)
                 previous[3] = max(previous[3], low_battery_rate)
 
+    for temperature in action_temperatures:
+        for percent in action_percentages:
+            perturbed = Observation(
+                source=observation.source,
+                percent=percent,
+                temperature_c=temperature,
+                charging=observation.charging,
+                observed_at=observation.observed_at,
+                warnings=observation.warnings,
+            )
+            decision = PolicyEngine(cooling=cooling).decide(config, perturbed)
+            key = (decision.action, decision.cooling)
+            action_distance = max(
+                _normalized_axis_distance(
+                    observation.temperature_c,
+                    temperature,
+                    bounds.temperature_c,
+                ),
+                _normalized_axis_distance(
+                    observation.percent,
+                    percent,
+                    bounds.charge_pct,
+                ),
+            )
+            previous_distance = action_distances.get(key)
+            if previous_distance is None or action_distance < previous_distance:
+                action_distances[key] = action_distance
+
     return tuple(
         _TransitionEnvelope(
             action,
@@ -252,6 +386,7 @@ def _possible_transitions(
             maximum_hot_rate=rates[1],
             minimum_low_battery_rate=rates[2],
             maximum_low_battery_rate=rates[3],
+            minimum_action_distance=action_distances.get((action, next_cooling)),
         )
         for (action, next_cooling), rates in outcomes.items()
     )
@@ -274,7 +409,7 @@ def _reference(
     return float(value) + 0.0
 
 
-def analyze_sensitivity(
+def _analyze_sensitivity(
     config: PolicyConfig,
     observations: Sequence[Observation],
     durations: Sequence[float],
@@ -282,7 +417,8 @@ def analyze_sensitivity(
     *,
     hot_ref_c: float = 35.0,
     low_battery_ref_pct: float = 20.0,
-) -> SensitivityResult:
+    include_action_margin: bool,
+) -> tuple[SensitivityResult, Optional[ActionChangeMargin]]:
     """Propagate every admissible decision path through thermal hysteresis.
 
     Objective intervals are marginal: each minimum and maximum is tight, but
@@ -322,11 +458,19 @@ def analyze_sensitivity(
     ambiguous_seconds = 0.0
     stable_samples = 0
     ambiguous_samples = 0
+    nominal_engine = PolicyEngine()
+    matching_prefixes: dict[bool, float] = {False: 0.0}
+    best_change: Optional[tuple[float, int, str, bool]] = None
+    best_context: Optional[tuple[str, Action, Action]] = None
 
-    for observation, raw_duration in zip(observations, durations):
+    for sample_index, (observation, raw_duration) in enumerate(zip(observations, durations), 1):
         duration = float(raw_duration)
         next_reachable: dict[bool, _ObjectiveEnvelope] = {}
         possible_actions: set[Action] = set()
+        transitions_by_cooling: dict[bool, tuple[_TransitionEnvelope, ...]] = {}
+        nominal_action = (
+            nominal_engine.decide(config, observation).action if include_action_margin else None
+        )
 
         for cooling, envelope in reachable.items():
             transitions = _possible_transitions(
@@ -336,7 +480,9 @@ def analyze_sensitivity(
                 cooling,
                 hot_ref_c=hot_reference,
                 low_battery_ref_pct=low_battery_reference,
+                track_action_distance=include_action_margin,
             )
+            transitions_by_cooling[cooling] = transitions
             for transition in transitions:
                 possible_actions.add(transition.action)
                 run_increment = 0.0 if transition.action is Action.STOP else duration
@@ -373,6 +519,36 @@ def analyze_sensitivity(
                         ),
                     )
 
+        if include_action_margin:
+            if nominal_action is None:
+                raise AssertionError("action-margin analysis requires a nominal action")
+            next_matching: dict[bool, float] = {}
+            for cooling, prefix_distance in matching_prefixes.items():
+                for transition in transitions_by_cooling[cooling]:
+                    local_distance = transition.minimum_action_distance
+                    if local_distance is None:
+                        raise AssertionError("action-margin transitions require a distance")
+                    candidate_distance = max(prefix_distance, local_distance)
+                    if transition.action is not nominal_action:
+                        candidate_key = (
+                            candidate_distance,
+                            sample_index,
+                            transition.action.value,
+                            transition.cooling,
+                        )
+                        if best_change is None or candidate_key < best_change:
+                            best_change = candidate_key
+                            best_context = (
+                                observation.observed_at,
+                                nominal_action,
+                                transition.action,
+                            )
+                        continue
+                    previous_distance = next_matching.get(transition.cooling)
+                    if previous_distance is None or candidate_distance < previous_distance:
+                        next_matching[transition.cooling] = candidate_distance
+            matching_prefixes = next_matching
+
         if len(possible_actions) == 1:
             stable_seconds += duration
             stable_samples += 1
@@ -381,7 +557,7 @@ def analyze_sensitivity(
             ambiguous_samples += 1
         reachable = next_reachable
 
-    return SensitivityResult(
+    result = SensitivityResult(
         minimum_run_seconds=min(value.minimum_run for value in reachable.values()),
         maximum_run_seconds=max(value.maximum_run for value in reachable.values()),
         minimum_hot_run_degc_seconds=min(value.minimum_hot for value in reachable.values()),
@@ -397,3 +573,65 @@ def analyze_sensitivity(
         action_stable_samples=stable_samples,
         action_ambiguous_samples=ambiguous_samples,
     )
+    if not include_action_margin:
+        return result, None
+    if best_change is None:
+        return result, ActionChangeMargin(minimum_normalized_action_distance=None)
+    if best_context is None:
+        raise AssertionError("an action change requires critical context")
+    observed_at, nominal_action, alternative_action = best_context
+    return result, ActionChangeMargin(
+        minimum_normalized_action_distance=best_change[0],
+        critical_sample=best_change[1],
+        observed_at=observed_at,
+        nominal_action=nominal_action,
+        alternative_action=alternative_action,
+    )
+
+
+def analyze_sensitivity(
+    config: PolicyConfig,
+    observations: Sequence[Observation],
+    durations: Sequence[float],
+    bounds: SensitivityBounds,
+    *,
+    hot_ref_c: float = 35.0,
+    low_battery_ref_pct: float = 20.0,
+) -> SensitivityResult:
+    """Return tight bounded objective envelopes and local action stability."""
+
+    result, _ = _analyze_sensitivity(
+        config,
+        observations,
+        durations,
+        bounds,
+        hot_ref_c=hot_ref_c,
+        low_battery_ref_pct=low_battery_ref_pct,
+        include_action_margin=False,
+    )
+    return result
+
+
+def analyze_sensitivity_with_margin(
+    config: PolicyConfig,
+    observations: Sequence[Observation],
+    durations: Sequence[float],
+    bounds: SensitivityBounds,
+    *,
+    hot_ref_c: float = 35.0,
+    low_battery_ref_pct: float = 20.0,
+) -> tuple[SensitivityResult, ActionChangeMargin]:
+    """Also find the nearest admitted representative path with another action sequence."""
+
+    result, margin = _analyze_sensitivity(
+        config,
+        observations,
+        durations,
+        bounds,
+        hot_ref_c=hot_ref_c,
+        low_battery_ref_pct=low_battery_ref_pct,
+        include_action_margin=True,
+    )
+    if margin is None:
+        raise AssertionError("action-margin analysis did not produce a result")
+    return result, margin

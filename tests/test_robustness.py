@@ -8,7 +8,12 @@ import pytest
 from trainguard.config import PolicyConfig
 from trainguard.model import Action, Observation, PowerSource
 from trainguard.policy import PolicyEngine
-from trainguard.robustness import SensitivityBounds, SensitivityError, analyze_sensitivity
+from trainguard.robustness import (
+    SensitivityBounds,
+    SensitivityError,
+    analyze_sensitivity,
+    analyze_sensitivity_with_margin,
+)
 
 
 def _observation(second: int, temperature: float | None) -> Observation:
@@ -201,3 +206,155 @@ def test_dynamic_program_matches_an_independent_enumeration_and_boundary_contrac
         analyze_sensitivity(policy, [], [], SensitivityBounds())
     with pytest.raises(SensitivityError, match="one duration"):
         analyze_sensitivity(policy, observations, durations[:-1], SensitivityBounds())
+
+
+def test_action_change_margin_tracks_hidden_state_and_binary64_edges():
+    policy = PolicyConfig()
+    battery_stop = Observation(
+        source=PowerSource.BATTERY,
+        percent=50.0,
+        temperature_c=41.75,
+        charging=False,
+        observed_at="2026-08-08T12:00:00Z",
+    )
+    warm_ac = _observation(1, 37.0)
+    bounds = SensitivityBounds(temperature_c=0.5)
+    envelope, stateful = analyze_sensitivity_with_margin(
+        policy,
+        [battery_stop, warm_ac],
+        [1.0, 0.0],
+        bounds,
+    )
+    # At sample 1 both paths stop, but only 42C enters cooldown. The altered
+    # state first changes the action at the zero-duration final sample.
+    assert envelope == analyze_sensitivity(policy, [battery_stop, warm_ac], [1.0, 0.0], bounds)
+    assert stateful.minimum_normalized_action_distance == 0.5
+    assert stateful.critical_sample == 2
+    assert (stateful.nominal_action, stateful.alternative_action) == (
+        Action.FULL,
+        Action.STOP,
+    )
+    assert stateful.to_dict() == {
+        "model": "bounded_minimum_distortion",
+        "metric": "normalized_linf",
+        "numeric_domain": "ieee_754_binary64",
+        "minimum_normalized_action_distance": 0.5,
+        "minimum_normalized_action_distance_hex": "0x1.0000000000000p-1",
+        "stable_for_declared_box": False,
+        "critical_sample": {
+            "sample": 2,
+            "observed_at": warm_ac.observed_at,
+            "nominal_action": "full",
+            "alternative_action": "stop",
+        },
+    }
+    report = envelope.to_dict(bounds, action_change_margin=stateful)
+    assert report["schema_version"] == 3
+    assert report["action_change_margin"] == stateful.to_dict()
+
+    charging = Observation(
+        source=PowerSource.AC,
+        percent=80.0,
+        temperature_c=35.0,
+        charging=True,
+        observed_at="2026-08-08T12:00:00Z",
+    )
+    _, strict = analyze_sensitivity_with_margin(
+        policy,
+        [charging],
+        [0.0],
+        SensitivityBounds(charge_pct=1.0),
+    )
+    assert strict.minimum_normalized_action_distance == math.ulp(80.0)
+
+    # Endpoint construction can make a second quotient microscopically exceed
+    # one. An endpoint already admitted to the full box saturates at one.
+    _, endpoint = analyze_sensitivity_with_margin(
+        PolicyConfig(temp_gentle_c=35.1),
+        [_observation(0, 35.0)],
+        [0.0],
+        SensitivityBounds(temperature_c=0.1),
+    )
+    assert endpoint.minimum_normalized_action_distance == 1.0
+
+    _, stable = analyze_sensitivity_with_margin(
+        policy,
+        [_observation(0, 30.0)],
+        [0.0],
+        SensitivityBounds(temperature_c=0.5, charge_pct=1.0),
+    )
+    assert stable.minimum_normalized_action_distance is None
+    assert stable.to_dict()["stable_for_declared_box"] is True
+    assert stable.to_dict()["critical_sample"] is None
+
+
+def test_action_change_margin_matches_independent_tiny_trace_enumeration():
+    policy = PolicyConfig()
+    temperature_width = math.ulp(42.0)
+    observations = [
+        Observation(
+            source=PowerSource.BATTERY,
+            percent=50.0,
+            temperature_c=math.nextafter(42.0, -math.inf),
+            charging=False,
+            observed_at="2026-08-08T12:00:00Z",
+        ),
+        _observation(1, 37.0),
+    ]
+
+    def all_binary64(recorded: float) -> tuple[float, ...]:
+        value = recorded - temperature_width
+        high = recorded + temperature_width
+        values = []
+        while value <= high:
+            values.append(value)
+            value = math.nextafter(value, math.inf)
+        return tuple(values)
+
+    nominal_engine = PolicyEngine()
+    nominal_actions = [
+        nominal_engine.decide(policy, observation).action for observation in observations
+    ]
+    brute_force_distances = []
+    candidate_temperatures = []
+    for observation in observations:
+        if observation.temperature_c is None:
+            raise AssertionError("this oracle requires recorded temperatures")
+        candidate_temperatures.append(all_binary64(observation.temperature_c))
+    for temperatures in itertools.product(*candidate_temperatures):
+        engine = PolicyEngine()
+        actions = []
+        distance = 0.0
+        for observation, temperature in zip(observations, temperatures):
+            perturbed = Observation(
+                source=observation.source,
+                percent=observation.percent,
+                temperature_c=temperature,
+                charging=observation.charging,
+                observed_at=observation.observed_at,
+            )
+            actions.append(engine.decide(policy, perturbed).action)
+            distance = max(
+                distance,
+                min(
+                    1.0,
+                    abs(temperature - float(observation.temperature_c)) / temperature_width,
+                ),
+            )
+        if actions != nominal_actions:
+            brute_force_distances.append(distance)
+
+    envelope, margin = analyze_sensitivity_with_margin(
+        policy,
+        observations,
+        [1.0, 0.0],
+        SensitivityBounds(temperature_c=temperature_width),
+    )
+    assert brute_force_distances
+    assert envelope == analyze_sensitivity(
+        policy,
+        observations,
+        [1.0, 0.0],
+        SensitivityBounds(temperature_c=temperature_width),
+    )
+    assert margin.minimum_normalized_action_distance == min(brute_force_distances)
