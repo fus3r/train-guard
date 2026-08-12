@@ -93,6 +93,10 @@ active guards
   quickstart [run]  guard=running (pid NNNNN)  state=full  pids=[NNNNN]
     last decision: full (ac_policy)
 
+restart after reboot (starts a new process; RAM state cannot survive a reboot)
+  login agent: INSTALLED
+  restart specs: none (add --restart-on-login to run/attach)
+
 $ train-guard stop quickstart
 [train-guard] stop requested for 'quickstart'; the supervisor acts after the next policy poll. (login restart removed)
 
