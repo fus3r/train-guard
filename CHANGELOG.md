@@ -1,5 +1,7 @@
 # Changelog
 
+## Unreleased
+
 ## 0.4.0 - 2026-08-12
 
 - Make `stop --kill` wait for termination, escalate survivors and retain

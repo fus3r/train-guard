@@ -12,3 +12,8 @@ updates:
     groups:
       development-dependencies:
         dependency-type: development
+
+  - package-ecosystem: pip
+    directory: /docs
+    schedule:
+      interval: weekly

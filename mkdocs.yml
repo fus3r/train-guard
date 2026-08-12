@@ -1,0 +1,49 @@
+site_name: train-guard
+site_description: Power-aware supervision for one long-running job.
+site_url: https://train-guard.readthedocs.io/en/latest/
+repo_url: https://github.com/fus3r/train-guard
+repo_name: fus3r/train-guard
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  font: false
+  palette:
+    scheme: default
+    primary: black
+    accent: light blue
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+
+plugins:
+  - search:
+      lang: en
+
+nav:
+  - Overview: index.md
+  - Getting started: getting-started.md
+  - Live supervision:
+      - Architecture and lifecycle: architecture.md
+      - Failure recovery: failure-model.md
+  - Offline analysis:
+      - Replay: policy-replay.md
+      - Replay sensitivity: replay-sensitivity.md
+      - Sweep and bounded sensitivity: policy-sweep.md
+  - Reference:
+      - CLI: cli.md
+      - Configuration: configuration.md
+  - Platforms and limitations: platforms.md
+  - Contributing and security: contributing-and-security.md
+
+exclude_docs: |
+  /requirements.txt
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn

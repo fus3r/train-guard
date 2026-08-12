@@ -15,3 +15,4 @@ htmlcov/
 *.log
 .DS_Store
 native/build/
+site/

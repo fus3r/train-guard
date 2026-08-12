@@ -1,0 +1,271 @@
+name: Publish train-guard 0.4.0
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-train-guard-0.4.0
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: v0.4.0
+  RELEASE_VERSION: 0.4.0
+  RELEASE_COMMIT: 80c2665358a2643b6818fb3b402a68e6898d4dcb
+
+jobs:
+  build-and-test:
+    name: Build and retest tagged artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Require a dispatch from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Dispatch this workflow from main, not ${GITHUB_REF}." >&2
+            exit 1
+          fi
+
+      - name: Check out the fixed release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v0.4.0
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify the annotated tag and reviewed commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" != "tag" ]]; then
+            echo "${RELEASE_TAG} is not an annotated tag." >&2
+            exit 1
+          fi
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          checkout_commit="$(git rev-parse HEAD)"
+          if [[ "${tag_commit}" != "${RELEASE_COMMIT}" ]]; then
+            echo "${RELEASE_TAG} resolves to ${tag_commit}, expected ${RELEASE_COMMIT}." >&2
+            exit 1
+          fi
+          if [[ "${checkout_commit}" != "${RELEASE_COMMIT}" ]]; then
+            echo "Checkout is ${checkout_commit}, expected ${RELEASE_COMMIT}." >&2
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Verify release versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          expected = os.environ["RELEASE_VERSION"]
+          with pathlib.Path("pyproject.toml").open("rb") as handle:
+              project_version = tomllib.load(handle)["project"]["version"]
+          cli_text = pathlib.Path("trainguard/cli.py").read_text(encoding="utf-8")
+          match = re.search(r'^__version__ = "([^"]+)"$', cli_text, re.MULTILINE)
+          if project_version != expected:
+              raise SystemExit(f"pyproject version {project_version!r}, expected {expected!r}")
+          if match is None or match.group(1) != expected:
+              actual = None if match is None else match.group(1)
+              raise SystemExit(f"CLI version {actual!r}, expected {expected!r}")
+          PY
+
+      - name: Install release tools
+        run: >-
+          python -m pip install "build==1.5.0" "twine==7.0.0"
+          "readme-renderer[md]==44.0"
+
+      - name: Build distributions once
+        run: python -m build
+
+      - name: Check distribution metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m twine check --strict dist/*
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          wheels=(dist/*.whl)
+          if (( ${#sdists[@]} != 1 || ${#wheels[@]} != 1 )); then
+            echo "Expected one source archive and one wheel." >&2
+            printf 'sdists: %s\n' "${sdists[*]:-none}" >&2
+            printf 'wheels: %s\n' "${wheels[*]:-none}" >&2
+            exit 1
+          fi
+
+      - name: Refuse relative project-description URLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import email.policy
+          import html.parser
+          import pathlib
+          import urllib.parse
+          import zipfile
+
+          from readme_renderer.markdown import render
+
+
+          class URLCollector(html.parser.HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.urls = []
+
+              def handle_starttag(self, _tag, attrs):
+                  for name, value in attrs:
+                      if name in {"href", "src"} and value:
+                          self.urls.append(value)
+
+
+          wheels = list(pathlib.Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one wheel, found {wheels}")
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              metadata_names = [
+                  name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
+              ]
+              if len(metadata_names) != 1:
+                  raise SystemExit(f"expected one METADATA file, found {metadata_names}")
+              metadata = email.message_from_bytes(
+                  wheel.read(metadata_names[0]), policy=email.policy.default
+              )
+
+          rendered = render(metadata.get_payload())
+          if rendered is None:
+              raise SystemExit("wheel project description did not render")
+          collector = URLCollector()
+          collector.feed(rendered)
+          invalid = sorted(
+              {
+                  url
+                  for url in collector.urls
+                  if not url.startswith("#")
+                  and urllib.parse.urlsplit(url).scheme not in {"http", "https"}
+              }
+          )
+          if invalid:
+              raise SystemExit(
+                  "wheel project description contains relative or unsupported URLs: "
+                  + ", ".join(invalid)
+              )
+          PY
+
+      - name: Retest the extracted source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_root="${RUNNER_TEMP}/train-guard-sdist"
+          source_venv="${RUNNER_TEMP}/train-guard-sdist-venv"
+          mkdir -p "${source_root}"
+          tar -xzf dist/*.tar.gz -C "${source_root}"
+          extracted="$(find "${source_root}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          if [[ -z "${extracted}" ]]; then
+            echo "Source archive did not contain one top-level directory." >&2
+            exit 1
+          fi
+          python -m venv "${source_venv}"
+          "${source_venv}/bin/python" -m pip install "${extracted}[test]"
+          cd "${extracted}"
+          "${source_venv}/bin/python" -m pytest
+
+      - name: Smoke-test the wheel outside the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel_venv="${RUNNER_TEMP}/train-guard-wheel-venv"
+          smoke_root="${RUNNER_TEMP}/train-guard-wheel-smoke"
+          wheel_path="$(realpath dist/*.whl)"
+          mkdir -p "${smoke_root}"
+          cp config.example.json "${smoke_root}/config.json"
+          cp examples/power-trace.jsonl "${smoke_root}/trace.jsonl"
+          printf '{"temp_pause_c":[40,42,44],"run_on_battery":[true,false]}\n' \
+            > "${smoke_root}/grid.json"
+          python -m venv "${wheel_venv}"
+          "${wheel_venv}/bin/python" -m pip install "${wheel_path}"
+          "${wheel_venv}/bin/python" -m pip check
+          cd "${smoke_root}"
+          export TRAIN_GUARD_HOME="${smoke_root}/must-not-exist"
+          "${wheel_venv}/bin/train-guard" --version \
+            | grep -Fx "train-guard ${RELEASE_VERSION}"
+          "${wheel_venv}/bin/train-guard" --help > /dev/null
+          "${wheel_venv}/bin/train-guard" simulate trace.jsonl \
+            --config config.json --json > nominal-replay.json
+          "${wheel_venv}/bin/train-guard" simulate trace.jsonl \
+            --config config.json --temperature-uncertainty-c 0.5 \
+            --charge-uncertainty-pct 1 --json > bounded-replay.json
+          "${wheel_venv}/bin/train-guard" sweep trace.jsonl \
+            --grid grid.json --config config.json --engine python \
+            --temperature-uncertainty-c 0.5 \
+            --charge-uncertainty-pct 1 --json > bounded-sweep.json
+          if [[ -e "${TRAIN_GUARD_HOME}" ]]; then
+            echo "Offline commands created TRAIN_GUARD_HOME." >&2
+            exit 1
+          fi
+
+      - name: Upload the tested distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: train-guard-0.4.0
+          path: |
+            dist/*.tar.gz
+            dist/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish tested artifacts to PyPI
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/train-guard
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download the tested distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: train-guard-0.4.0
+          path: dist
+
+      - name: Refuse an unexpected artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          wheels=(dist/*.whl)
+          files=(dist/*)
+          if (( ${#sdists[@]} != 1 || ${#wheels[@]} != 1 || ${#files[@]} != 2 )); then
+            echo "Expected exactly one source archive and one wheel." >&2
+            printf '%s\n' "${files[@]:-dist is empty}" >&2
+            exit 1
+          fi
+
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/
