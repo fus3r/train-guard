@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -15,12 +16,15 @@ from trainguard.native import (
     KernelError,
     KernelRow,
     encode_request,
+    encode_sensitivity_request,
     epoch_microseconds,
     fnv1a_decisions,
     resolve_thread_count,
     run_kernel,
+    run_sensitivity_kernel,
 )
 from trainguard.policy import PolicyEngine
+from trainguard.robustness import SensitivityBounds, SensitivityResult, analyze_sensitivity
 from trainguard.simulation import load_trace, ordered_timestamps
 from trainguard.sweep import SweepError, _python_rows, parse_grid, run_sweep
 
@@ -87,6 +91,23 @@ def test_request_encoding_round_trips_optional_fields():
     assert lines[0] == "TGK 1 1 7 1 {} {}".format((35.0).hex(), (20.0).hex())
     assert lines[1].startswith("P 0 ")
     assert lines[2].split()[1] == str(epoch_microseconds(timestamps[0]))
+    assert hashlib.sha256(request.encode()).hexdigest() == (
+        "fc058f476ab41b0b974558f7589f8b741b8d4cdb38d84ca896a2c9368b807c71"
+    )
+
+    sensitivity_request = encode_sensitivity_request(
+        [PolicyConfig()],
+        observations,
+        timestamps,
+        SensitivityBounds(temperature_c=0.5, charge_pct=1.0),
+        hot_ref_c=35.0,
+        low_battery_ref_pct=20.0,
+    )
+    sensitivity_lines = sensitivity_request.splitlines()
+    assert sensitivity_lines[0] == "TGS 1 1 7 {} {} {} {}".format(
+        (35.0).hex(), (20.0).hex(), (0.5).hex(), (1.0).hex()
+    )
+    assert sensitivity_lines[1:] == lines[1:]
 
 
 def test_kernel_agrees_bit_for_bit_with_python_reference(kernel_binary: Path):
@@ -137,6 +158,30 @@ def test_kernel_agrees_bit_for_bit_with_python_reference(kernel_binary: Path):
 
     assert kernel_rows == python_rows
 
+    bounds = SensitivityBounds(temperature_c=0.5, charge_pct=1.0)
+    kernel_sensitivity = run_sensitivity_kernel(
+        kernel_binary,
+        policies,
+        observations,
+        timestamps,
+        bounds,
+        hot_ref_c=35.0,
+        low_battery_ref_pct=60.0,
+        threads=3,
+    )
+    python_sensitivity = [
+        analyze_sensitivity(
+            policy,
+            observations,
+            durations,
+            bounds,
+            hot_ref_c=35.0,
+            low_battery_ref_pct=60.0,
+        )
+        for policy in policies
+    ]
+    assert kernel_sensitivity == python_sensitivity
+
 
 def test_sweep_auto_uses_only_a_verified_kernel(kernel_binary: Path, monkeypatch):
     monkeypatch.setenv("TRAIN_GUARD_KERNEL", str(kernel_binary))
@@ -144,6 +189,7 @@ def test_sweep_auto_uses_only_a_verified_kernel(kernel_binary: Path, monkeypatch
         PolicyConfig(),
         parse_grid('{"run_on_battery": [true]}'),
         load_trace(EXAMPLE_TRACE),
+        sensitivity=SensitivityBounds(temperature_c=0.5, charge_pct=1.0),
     )
 
     assert report["engine"] == "native"
@@ -152,6 +198,12 @@ def test_sweep_auto_uses_only_a_verified_kernel(kernel_binary: Path, monkeypatch
         "full": 600.0,
         "gentle": 300.0,
         "stop": 900.0,
+    }
+    assert report["uncertainty"]["engine"] == "native"
+    assert report["uncertainty"]["kernel_verified_against_reference"] is True
+    assert report["baseline"]["sensitivity"]["run_seconds"] == {
+        "minimum": 600.0,
+        "maximum": 1500.0,
     }
 
 
@@ -166,6 +218,33 @@ def test_sweep_refuses_a_kernel_baseline_mismatch(monkeypatch):
             parse_grid('{"run_on_battery": [true]}'),
             load_trace(EXAMPLE_TRACE),
             engine="native",
+        )
+
+    def matching_nominal(_kernel, policies, observations, timestamps, **kwargs):
+        durations = [0.0] * len(observations)
+        for index in range(len(observations) - 1):
+            durations[index] = (timestamps[index + 1] - timestamps[index]).total_seconds()
+        return _python_rows(
+            policies,
+            observations,
+            durations,
+            hot_ref_c=kwargs["hot_ref_c"],
+            low_battery_ref_pct=kwargs["low_battery_ref_pct"],
+        )
+
+    bad_sensitivity = SensitivityResult(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+    monkeypatch.setattr("trainguard.sweep.run_kernel", matching_nominal)
+    monkeypatch.setattr(
+        "trainguard.sweep.run_sensitivity_kernel",
+        lambda *args, **kwargs: [bad_sensitivity, bad_sensitivity],
+    )
+    with pytest.raises(SweepError, match="Python sensitivity reference"):
+        run_sweep(
+            PolicyConfig(),
+            parse_grid('{"run_on_battery": [true]}'),
+            load_trace(EXAMPLE_TRACE),
+            engine="native",
+            sensitivity=SensitivityBounds(temperature_c=0.5, charge_pct=1.0),
         )
 
 
@@ -185,6 +264,35 @@ def test_kernel_protocol_errors_fail_closed_through_the_cli(tmp_path, monkeypatc
             hot_ref_c=35.0,
             low_battery_ref_pct=20.0,
         )
+
+    bad_sensitivity_responses = (
+        ("TGK 1 OK\nEND\n", "unexpected sensitivity handshake"),
+        ("TGS 1 OK\nEND\n", "truncated sensitivity response"),
+        (
+            "TGS 1 OK\nS 0x1p+1 0x1p+0 0x0p+0 0x0p+0 0x0p+0 0x0p+0 0x0p+0 0x0p+0 1 0\nEND\n",
+            "invalid sensitivity bounds",
+        ),
+        (
+            "TGS 1 OK\nS 0x0p+0 0x0p+0 0x0p+0 0x0p+0 0x0p+0 0x0p+0 0x0p+0 0x0p+0 6 0\nEND\n",
+            "invalid sensitivity bounds",
+        ),
+    )
+    for stdout, message in bad_sensitivity_responses:
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+        monkeypatch.setattr(
+            "trainguard.native.subprocess.run",
+            lambda *args, _completed=completed, **kwargs: _completed,
+        )
+        with pytest.raises(KernelError, match=message):
+            run_sensitivity_kernel(
+                tmp_path / "kernel",
+                [PolicyConfig()],
+                observations,
+                timestamps,
+                SensitivityBounds(temperature_c=0.5, charge_pct=1.0),
+                hot_ref_c=35.0,
+                low_battery_ref_pct=20.0,
+            )
 
     grid = tmp_path / "grid.json"
     grid.write_text('{"run_on_battery": [true]}', encoding="utf-8")
@@ -229,18 +337,27 @@ def test_kernel_output_is_byte_identical_across_thread_counts(kernel_binary: Pat
         low_battery_ref_pct=20.0,
         emit_actions=False,
     )
-    outputs = []
-    for threads in ("1", "3"):
-        result = subprocess.run(
-            [str(kernel_binary), threads],
-            input=request,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0
-        outputs.append(result.stdout)
-    assert outputs[0] == outputs[1]
+    sensitivity_request = encode_sensitivity_request(
+        policies,
+        observations,
+        timestamps,
+        SensitivityBounds(temperature_c=0.5, charge_pct=1.0),
+        hot_ref_c=35.0,
+        low_battery_ref_pct=20.0,
+    )
+    for protocol_request in (request, sensitivity_request):
+        outputs = []
+        for threads in ("1", "3"):
+            result = subprocess.run(
+                [str(kernel_binary), threads],
+                input=protocol_request,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0
+            outputs.append(result.stdout)
+        assert outputs[0] == outputs[1]
 
     rows = run_kernel(
         kernel_binary,
@@ -310,3 +427,20 @@ def test_kernel_rejects_malformed_requests(kernel_binary: Path):
         check=False,
     )
     assert wrong_version.returncode == 3
+
+    malformed = (
+        ("BAD 1 1 1 0 0x0p+0 0x0p+0\n", "TGK or TGS"),
+        ("TGS 1 0 1 0x0p+0 0x0p+0 0x0p+0 0x0p+0\n", "at least 1"),
+        ("TGS 1 1 1 0x0p+0 0x0p+0 -0x1p+0 0x0p+0\n", "half-widths"),
+        ("TGS 1 1 1 0x0p+0 0x0p+0 0x1.2dp+8 0x0p+0\n", "supported domain"),
+    )
+    for request, message in malformed:
+        result = subprocess.run(
+            [str(kernel_binary)],
+            input=request,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert message in result.stderr

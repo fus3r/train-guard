@@ -69,7 +69,7 @@ train-guard sweep examples/power-trace.jsonl \
   --charge-uncertainty-pct 1 --json
 ```
 
-For each policy, the Python sensitivity pass propagates thermal cooldown and
+For each policy, the sensitivity pass propagates thermal cooldown and
 computes tight marginal intervals for run seconds, hot degree-seconds and
 low-battery run seconds. Bounds are adversarial rather than probabilistic:
 Train Guard does not infer sensor accuracy or report a confidence level. The
@@ -92,9 +92,7 @@ boxes, trade-offs, equality boundaries, duplicates and overlaps.
 Without bounds, the report remains schema 1 and preserves the nominal ranking.
 With bounds, it uses schema 2, adds each policy's `sensitivity` object and
 reports `interval_front_size`. The top-level `engine` still names the nominal
-row engine. `uncertainty.engine` is `python` even when the optional `TGK 1`
-kernel produced the nominal rows; bounded values do not cross the native
-protocol in this version.
+row engine. `uncertainty.engine` identifies the bounded pass separately.
 
 ## Reading the numbers honestly
 
@@ -236,6 +234,13 @@ subprocess call. It is a development and CI artifact: wheels stay pure
 Python, `--engine python` is always available, and the packaged CLI
 works without any compiler.
 
+Nominal rows use the backwards-compatible `TGK 1` protocol. When bounds are
+requested and a kernel is available, the separate `TGS 1` protocol evaluates
+the same finite two-state envelope propagation for every policy. Python still
+computes the baseline envelope independently and refuses every native row if
+that baseline differs by one bit. The benchmark's `--sensitivity` mode compares
+all native candidate envelopes with Python.
+
 The kernel has the following correctness contract:
 
 - floats cross the process boundary as C99 hexadecimal literals
@@ -269,10 +274,11 @@ To build and benchmark locally:
 ```bash
 cmake -S native -B native/build
 cmake --build native/build --config Release
-python tools/bench_sweep.py --kernel native/build/train-guard-kernel
+python tools/bench_sweep.py --kernel native/build/train-guard-kernel --sensitivity
 ```
 
 `tools/bench_sweep.py` prints its exact workload and kernel thread count,
-which is controllable with `--kernel-threads`. It verifies every row
-bit for bit, and reports wall-clock time for both engines. Timings are
-hardware-specific; publish them only with the printed protocol attached.
+which is controllable with `--kernel-threads`. It verifies every row bit for
+bit and reports wall-clock time for both engines including encoding, process
+spawn and decoding. Timings are hardware-specific; publish them only with the
+printed runtime, platform, machine, threads, policies and observations.

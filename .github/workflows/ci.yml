@@ -45,7 +45,7 @@ jobs:
           if [ "${RUNNER_OS}" = "Windows" ]; then
             kernel="native/build/Release/train-guard-kernel.exe"
           fi
-          python tools/bench_sweep.py --samples 4000 --kernel "${kernel}"
+          python tools/bench_sweep.py --samples 4000 --kernel "${kernel}" --sensitivity
       - name: Compile package
         run: python -m compileall -q trainguard
       - name: Check legacy macOS script syntax

@@ -10,12 +10,16 @@ it from a checkout with the kernel built:
 
 Timings are workload-specific: report them only with this protocol
 (sample count, grid size, hardware) attached.
+
+Pass ``--sensitivity`` to repeat the all-row differential benchmark for exact
+bounded objective envelopes.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import platform
 import sys
 import time
 from pathlib import Path
@@ -24,7 +28,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trainguard.config import PolicyConfig
 from trainguard.model import Observation, PowerSource
-from trainguard.native import find_kernel, resolve_thread_count, run_kernel
+from trainguard.native import (
+    find_kernel,
+    resolve_thread_count,
+    run_kernel,
+    run_sensitivity_kernel,
+)
+from trainguard.robustness import SensitivityBounds, analyze_sensitivity
 from trainguard.simulation import ordered_timestamps
 from trainguard.sweep import SweepGrid, _python_rows, expand_grid
 
@@ -69,6 +79,11 @@ def main() -> int:
         default=None,
         help="kernel worker threads (default: automatic, capped at 16)",
     )
+    parser.add_argument(
+        "--sensitivity",
+        action="store_true",
+        help="also benchmark exact +/-0.5C, +/-1 point interval propagation",
+    )
     args = parser.parse_args()
 
     if args.kernel:
@@ -107,6 +122,10 @@ def main() -> int:
         f"workload: {len(policies)} policies ({len(rejected)} grid combos rejected) x "
         f"{len(observations)} observations = {decisions} decisions, "
         f"kernel threads {threads}"
+    )
+    print(
+        f"runtime: Python {platform.python_version()} on {platform.platform()}, "
+        f"machine {platform.machine()}, kernel {kernel}"
     )
 
     started = time.perf_counter()
@@ -150,7 +169,50 @@ def main() -> int:
     )
     print(f"speedup: {python_elapsed / kernel_elapsed:.1f}x")
     print(f"bit-exact aggregate mismatches across all rows: {mismatches}")
-    return 0 if mismatches == 0 else 1
+    sensitivity_mismatches = 0
+    if args.sensitivity:
+        bounds = SensitivityBounds(temperature_c=0.5, charge_pct=1.0)
+        started = time.perf_counter()
+        python_sensitivity = [
+            analyze_sensitivity(
+                policy,
+                observations,
+                durations,
+                bounds,
+                hot_ref_c=35.0,
+                low_battery_ref_pct=20.0,
+            )
+            for policy in policies
+        ]
+        python_sensitivity_elapsed = time.perf_counter() - started
+
+        started = time.perf_counter()
+        kernel_sensitivity = run_sensitivity_kernel(
+            kernel,
+            policies,
+            observations,
+            timestamps,
+            bounds,
+            hot_ref_c=35.0,
+            low_battery_ref_pct=20.0,
+            threads=threads,
+        )
+        kernel_sensitivity_elapsed = time.perf_counter() - started
+        sensitivity_mismatches = sum(
+            python_row != kernel_row
+            for python_row, kernel_row in zip(python_sensitivity, kernel_sensitivity)
+        )
+        print("bounded sensitivity: temperature +/-0.5C, charge +/-1 point")
+        print(f"python sensitivity: {python_sensitivity_elapsed:.3f}s")
+        print(
+            f"native sensitivity: {kernel_sensitivity_elapsed:.3f}s including encode, "
+            "spawn and decode"
+        )
+        print(
+            f"sensitivity speedup: {python_sensitivity_elapsed / kernel_sensitivity_elapsed:.1f}x"
+        )
+        print(f"bit-exact sensitivity mismatches across all rows: {sensitivity_mismatches}")
+    return 0 if mismatches == 0 and sensitivity_mismatches == 0 else 1
 
 
 if __name__ == "__main__":

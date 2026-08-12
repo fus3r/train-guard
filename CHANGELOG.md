@@ -15,6 +15,9 @@
 - Extend `sweep` with Python bounded-objective envelopes and an exact
   `O(N log N)` interval-separation pass. Bounded reports use schema 2 and a
   conservative outer frontier enclosure; nominal reports remain schema 1.
+- Add the separate `TGS 1` native protocol for bounded sweep envelopes. Python
+  verifies the baseline bit for bit before accepting native rows, while `TGK 1`
+  remains unchanged for nominal replay.
 
 ## 0.3.0 - 2026-08-08
 

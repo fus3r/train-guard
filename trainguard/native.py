@@ -7,10 +7,14 @@ process boundary without changing a single bit. Floats therefore travel as
 C99 hexadecimal literals (``float.hex`` out, ``%a`` back), and timestamps as
 integer epoch microseconds, the same quantity ``timedelta.total_seconds``
 divides by ``1e6``.
+
+Nominal replay uses ``TGK 1``. Exact interval propagation uses the separate
+``TGS 1`` protocol so nominal compatibility does not depend on bounded sweeps.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import subprocess
@@ -22,11 +26,14 @@ from typing import Iterable, Optional, Sequence
 if __package__:
     from .config import PolicyConfig
     from .model import Action, DecisionReason, Observation, PowerSource
+    from .robustness import SensitivityBounds, SensitivityResult
 else:  # Keep direct CLI execution from a checkout working.
     from config import PolicyConfig
     from model import Action, DecisionReason, Observation, PowerSource
+    from robustness import SensitivityBounds, SensitivityResult
 
 PROTOCOL_VERSION = 1
+SENSITIVITY_PROTOCOL_VERSION = 1
 KERNEL_BINARY = "train-guard-kernel"
 # Worker threads split whole policies, never one policy's arithmetic, so
 # the cap is a politeness limit on a tool meant to protect its host, not
@@ -144,6 +151,19 @@ def encode_request(
             float(low_battery_ref_pct).hex(),
         )
     ]
+    lines.extend(_wire_rows(policies, observations, timestamps))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _wire_rows(
+    policies: Sequence[PolicyConfig],
+    observations: Sequence[Observation],
+    timestamps: Sequence[datetime],
+) -> list[str]:
+    """Encode the validated policy and observation rows shared by both protocols."""
+
+    lines: list[str] = []
     for policy in policies:
         lines.append(
             "P {} {} {} {} {} {} {} {} {}".format(
@@ -170,6 +190,32 @@ def encode_request(
                 int(bool(observation.charging)),
             )
         )
+    return lines
+
+
+def encode_sensitivity_request(
+    policies: Sequence[PolicyConfig],
+    observations: Sequence[Observation],
+    timestamps: Sequence[datetime],
+    bounds: SensitivityBounds,
+    *,
+    hot_ref_c: float,
+    low_battery_ref_pct: float,
+) -> str:
+    """Encode an exact bounded-sensitivity request for every policy."""
+
+    lines = [
+        "TGS {} {} {} {} {} {} {}".format(
+            SENSITIVITY_PROTOCOL_VERSION,
+            len(policies),
+            len(observations),
+            float(hot_ref_c).hex(),
+            float(low_battery_ref_pct).hex(),
+            bounds.temperature_c.hex(),
+            bounds.charge_pct.hex(),
+        )
+    ]
+    lines.extend(_wire_rows(policies, observations, timestamps))
     lines.append("")
     return "\n".join(lines)
 
@@ -202,6 +248,40 @@ def _parse_row(line: str, observation_count: int, actions: Optional[str]) -> Ker
         decision_transitions=decision_transitions,
         checksum=checksum,
         actions=actions,
+    )
+
+
+def _parse_sensitivity_row(line: str, observation_count: int) -> SensitivityResult:
+    fields = line.split()
+    if len(fields) != 11 or fields[0] != "S":
+        raise KernelError(f"kernel returned a malformed sensitivity row: {line!r}")
+    try:
+        values = [float.fromhex(field) for field in fields[1:9]]
+        stable_samples = int(fields[9])
+        ambiguous_samples = int(fields[10])
+    except ValueError as exc:
+        raise KernelError(f"kernel returned a malformed sensitivity row: {line!r}") from exc
+    if (
+        any(not math.isfinite(value) or value < 0.0 for value in values)
+        or values[0] > values[1]
+        or values[2] > values[3]
+        or values[4] > values[5]
+        or stable_samples < 0
+        or ambiguous_samples < 0
+        or stable_samples + ambiguous_samples != observation_count
+    ):
+        raise KernelError(f"kernel returned invalid sensitivity bounds: {line!r}")
+    return SensitivityResult(
+        minimum_run_seconds=values[0],
+        maximum_run_seconds=values[1],
+        minimum_hot_run_degc_seconds=values[2],
+        maximum_hot_run_degc_seconds=values[3],
+        minimum_low_battery_run_seconds=values[4],
+        maximum_low_battery_run_seconds=values[5],
+        action_stable_seconds=values[6],
+        action_ambiguous_seconds=values[7],
+        action_stable_samples=stable_samples,
+        action_ambiguous_samples=ambiguous_samples,
     )
 
 
@@ -264,3 +344,48 @@ def run_kernel(
         rows.append(_parse_row(lines[cursor], len(observations), actions))
         cursor += 2 if emit_actions else 1
     return rows
+
+
+def run_sensitivity_kernel(
+    kernel: Path,
+    policies: Sequence[PolicyConfig],
+    observations: Sequence[Observation],
+    timestamps: Sequence[datetime],
+    bounds: SensitivityBounds,
+    *,
+    hot_ref_c: float,
+    low_battery_ref_pct: float,
+    threads: Optional[int] = None,
+) -> list[SensitivityResult]:
+    """Evaluate exact marginal uncertainty envelopes in one native run."""
+
+    resolved_threads = resolve_thread_count(len(policies), requested=threads)
+    request = encode_sensitivity_request(
+        policies,
+        observations,
+        timestamps,
+        bounds,
+        hot_ref_c=hot_ref_c,
+        low_battery_ref_pct=low_battery_ref_pct,
+    )
+    try:
+        completed = subprocess.run(
+            [str(kernel), str(resolved_threads)],
+            input=request,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise KernelError(f"cannot execute kernel {kernel}: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"exit status {completed.returncode}"
+        raise KernelError(f"kernel {kernel} failed: {detail}")
+
+    lines = completed.stdout.splitlines()
+    expected_handshake = ["TGS", str(SENSITIVITY_PROTOCOL_VERSION), "OK"]
+    if not lines or lines[0].split() != expected_handshake:
+        raise KernelError(f"kernel {kernel} sent an unexpected sensitivity handshake")
+    if len(lines) != len(policies) + 2 or lines[-1] != "END":
+        raise KernelError(f"kernel {kernel} returned a truncated sensitivity response")
+    return [_parse_sensitivity_row(line, len(observations)) for line in lines[1:-1]]

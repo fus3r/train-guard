@@ -27,7 +27,14 @@ if __package__:
     )
     from .config import ConfigError, PolicyConfig, policy_from_mapping
     from .model import Action, DecisionReason, Observation, PowerSource
-    from .native import KernelError, KernelRow, find_kernel, fnv1a_decisions, run_kernel
+    from .native import (
+        KernelError,
+        KernelRow,
+        find_kernel,
+        fnv1a_decisions,
+        run_kernel,
+        run_sensitivity_kernel,
+    )
     from .policy import PolicyEngine
     from .robustness import SensitivityBounds, SensitivityResult, analyze_sensitivity
     from .simulation import TraceError, _fingerprint, ordered_timestamps
@@ -47,7 +54,14 @@ else:  # Keep direct CLI execution from a checkout working.
     from robustness import SensitivityBounds, SensitivityResult, analyze_sensitivity
     from simulation import TraceError, _fingerprint, ordered_timestamps
 
-    from native import KernelError, KernelRow, find_kernel, fnv1a_decisions, run_kernel
+    from native import (
+        KernelError,
+        KernelRow,
+        find_kernel,
+        fnv1a_decisions,
+        run_kernel,
+        run_sensitivity_kernel,
+    )
 
 
 DEFAULT_HOT_REFERENCE_C = 35.0
@@ -220,6 +234,25 @@ def _verify_kernel_row(python_row: KernelRow, kernel_row: KernelRow, kernel: Pat
         raise SweepError(
             f"native kernel {kernel} disagrees with the Python reference on the baseline "
             f"policy ({', '.join(mismatches)}); refusing its results"
+        )
+
+
+def _verify_sensitivity_row(
+    python_row: SensitivityResult,
+    kernel_row: SensitivityResult,
+    kernel: Path,
+) -> None:
+    """Refuse native envelopes if the baseline differs from Python by one bit."""
+
+    if python_row != kernel_row:
+        mismatches = [
+            name
+            for name in SensitivityResult.__dataclass_fields__
+            if getattr(python_row, name) != getattr(kernel_row, name)
+        ]
+        raise SweepError(
+            f"native kernel {kernel} disagrees with the Python sensitivity reference on "
+            f"the baseline policy ({', '.join(mismatches)}); refusing its results"
         )
 
 
@@ -540,20 +573,47 @@ def run_sweep(
 
     sensitivity_rows: Optional[list[SensitivityResult]] = None
     interval_flags: list[Optional[bool]] = [None] * len(candidate_rows)
+    sensitivity_engine: Optional[str] = None
+    kernel_sensitivity_verified = False
     if sensitivity is not None:
-        # TGK 1 covers nominal replay only, so bounded objectives stay on the
-        # Python reference even when the nominal rows came from the kernel.
-        sensitivity_rows = [
-            analyze_sensitivity(
-                policy,
-                observations,
-                durations,
-                sensitivity,
-                hot_ref_c=hot_ref_c,
-                low_battery_ref_pct=low_battery_ref_pct,
+        baseline_sensitivity = analyze_sensitivity(
+            base,
+            observations,
+            durations,
+            sensitivity,
+            hot_ref_c=hot_ref_c,
+            low_battery_ref_pct=low_battery_ref_pct,
+        )
+        if kernel is not None:
+            try:
+                sensitivity_rows = run_sensitivity_kernel(
+                    kernel,
+                    policies,
+                    observations,
+                    timestamps,
+                    sensitivity,
+                    hot_ref_c=hot_ref_c,
+                    low_battery_ref_pct=low_battery_ref_pct,
+                )
+            except KernelError as exc:
+                raise SweepError(str(exc)) from exc
+            _verify_sensitivity_row(baseline_sensitivity, sensitivity_rows[0], kernel)
+            sensitivity_engine = "native"
+            kernel_sensitivity_verified = True
+        else:
+            sensitivity_rows = [baseline_sensitivity]
+            sensitivity_rows.extend(
+                analyze_sensitivity(
+                    policy,
+                    observations,
+                    durations,
+                    sensitivity,
+                    hot_ref_c=hot_ref_c,
+                    low_battery_ref_pct=low_battery_ref_pct,
+                )
+                for policy in policies[1:]
             )
-            for policy in policies
-        ]
+            sensitivity_engine = "python"
         interval_flags = list(_interval_front_flags(sensitivity_rows[1:]))
 
     reports = [
@@ -633,7 +693,8 @@ def run_sweep(
     if sensitivity is not None:
         report["uncertainty"] = {
             "bounds": sensitivity.to_dict(),
-            "engine": "python",
+            "engine": sensitivity_engine,
+            "kernel_verified_against_reference": kernel_sensitivity_verified,
             "frontier_method": "marginal_interval_separation",
             "frontier_guarantee": (
                 "excluded candidates are worse across their entire objective box; "

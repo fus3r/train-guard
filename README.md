@@ -260,12 +260,15 @@ MSVC on every push and re-runs that differential check. Wheels stay pure
 Python; without the kernel, `sweep` uses the same engine the live
 supervisor runs.
 
-`TGK 1` accelerates nominal rows only. Bounded sweep envelopes remain on the
-Python reference and do not cross the native protocol in this version.
+Nominal replay keeps the `TGK 1` protocol. Bounded sweeps use the separate
+`TGS 1` protocol to propagate cooldown and marginal objective envelopes over
+the same finite binary64 representatives as Python. The baseline envelope is
+checked bit for bit before native rows are accepted; malformed or divergent
+responses fail the sweep instead of falling back silently.
 
 ```bash
 cmake -S native -B native/build && cmake --build native/build --config Release
-python tools/bench_sweep.py --kernel native/build/train-guard-kernel
+python tools/bench_sweep.py --kernel native/build/train-guard-kernel --sensitivity
 python tools/bench_pareto.py
 ```
 
@@ -274,7 +277,9 @@ evaluated start-to-finish by one thread and rows are emitted in input
 order, so kernel output is byte-identical for every thread count and
 the differential check is unaffected. The bundled benchmark evaluates
 421 policies over 20,000 observations, or 8.42 million decisions, and
-checks every row before reporting hardware-specific wall-clock timings.
+checks every nominal and requested sensitivity row before reporting
+hardware-specific wall-clock timings, including encode, process spawn and
+decode overhead.
 Timing is not an acceptance gate. Run the script for results on your machine.
 
 After replay, Pareto dominance is computed in `O(N + U log U)` time for `N`
@@ -388,8 +393,9 @@ python -m build
 
 The combined statement-and-branch coverage gate is 90 percent. CI runs on
 Ubuntu, macOS and Windows with Python 3.9 and 3.13, builds the native replay
-kernel with each platform's compiler and checks it against the Python engine
-bit for bit, then builds and installs the wheel in a clean step. The test
+kernel with each platform's compiler and checks nominal and bounded-sensitivity
+rows against the Python engine bit for bit, then builds and installs the wheel
+in a clean step. The test
 suite includes a real detached `run` → `status` → `events` → `stop`
 lifecycle alongside focused tests that isolate process calls.
 The source archive contains the complete test suite, including its fixtures,

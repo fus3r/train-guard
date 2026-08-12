@@ -27,6 +27,14 @@
 //          <action_transitions> <decision_transitions> <fnv1a64>
 //        A <one digit per observation>            (only when emit_actions)
 //        END
+//
+// Exact bounded sensitivity uses a separate backwards-compatible protocol:
+//   in : TGS 1 <policies> <observations> <hot_ref> <low_ref> <temp_hw> <charge_hw>
+//        followed by the same P and O rows
+//   out: TGS 1 OK
+//        S <min_run> <max_run> <min_hot> <max_hot> <min_low> <max_low>
+//          <stable_s> <ambiguous_s> <stable_samples> <ambiguous_samples>
+//        END
 // Sources: 0=ac 1=battery 2=no_battery. Bands and actions: 0=full
 // 1=gentle 2=stop. A change to any of this is a protocol version bump.
 //
@@ -45,6 +53,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -144,6 +154,29 @@ struct Row {
   std::uint64_t checksum;
 };
 
+struct ObjectiveEnvelope {
+  bool reachable;
+  double minimum_run;
+  double maximum_run;
+  double minimum_hot;
+  double maximum_hot;
+  double minimum_low;
+  double maximum_low;
+};
+
+struct SensitivityRow {
+  double minimum_run;
+  double maximum_run;
+  double minimum_hot;
+  double maximum_hot;
+  double minimum_low;
+  double maximum_low;
+  double stable_seconds;
+  double ambiguous_seconds;
+  std::int64_t stable_samples;
+  std::int64_t ambiguous_samples;
+};
+
 // This function is the exactness contract: the same operations in the
 // same order as trainguard.sweep._python_rows. It is shared by the
 // sequential and threaded paths so they cannot diverge; a policy's whole
@@ -190,11 +223,163 @@ Row evaluate(const Policy& policy, const std::vector<Obs>& observations, double 
   return row;
 }
 
+std::vector<double> representatives(double value, double half_width,
+                                    const std::vector<double>& thresholds, double lower,
+                                    double upper) {
+  const double low = std::max(lower, value - half_width);
+  const double high = std::min(upper, value + half_width);
+  std::vector<double> points{low, high};
+  points.reserve(2 + thresholds.size() * 3);
+  for (const double threshold : thresholds) {
+    if (low <= threshold && threshold <= high) {
+      points.push_back(threshold);
+    }
+    const double below = std::nextafter(threshold, -std::numeric_limits<double>::infinity());
+    const double above = std::nextafter(threshold, std::numeric_limits<double>::infinity());
+    if (low <= below && below <= high) {
+      points.push_back(below);
+    }
+    if (low <= above && above <= high) {
+      points.push_back(above);
+    }
+  }
+  std::sort(points.begin(), points.end());
+  points.erase(std::unique(points.begin(), points.end()), points.end());
+  return points;
+}
+
+void update_envelope(ObjectiveEnvelope& target, const ObjectiveEnvelope& source,
+                     const Decision& decision, double duration, double hot_rate,
+                     double low_rate) {
+  const double run_increment = decision.action == kStop ? 0.0 : duration;
+  const double minimum_run = source.minimum_run + run_increment;
+  const double maximum_run = source.maximum_run + run_increment;
+  const double minimum_hot = source.minimum_hot + hot_rate * duration;
+  const double maximum_hot = source.maximum_hot + hot_rate * duration;
+  const double minimum_low = source.minimum_low + low_rate * duration;
+  const double maximum_low = source.maximum_low + low_rate * duration;
+  if (!target.reachable) {
+    target = {true, minimum_run, maximum_run, minimum_hot, maximum_hot, minimum_low,
+              maximum_low};
+    return;
+  }
+  target.minimum_run = std::min(target.minimum_run, minimum_run);
+  target.maximum_run = std::max(target.maximum_run, maximum_run);
+  target.minimum_hot = std::min(target.minimum_hot, minimum_hot);
+  target.maximum_hot = std::max(target.maximum_hot, maximum_hot);
+  target.minimum_low = std::min(target.minimum_low, minimum_low);
+  target.maximum_low = std::max(target.maximum_low, maximum_low);
+}
+
+SensitivityRow evaluate_sensitivity(const Policy& policy, const std::vector<Obs>& observations,
+                                    double hot_ref, double low_ref, double temperature_half_width,
+                                    double charge_half_width) {
+  ObjectiveEnvelope reachable[2]{};
+  reachable[0] = {true, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  SensitivityRow result{};
+
+  const std::vector<double> temperature_thresholds{
+      policy.temp_resume_c, policy.temp_pause_c, policy.temp_charge_gentle_c,
+      policy.temp_gentle_c, hot_ref};
+  const std::vector<double> percent_thresholds{
+      policy.battery_floor_pct, policy.charge_cool_until_pct, low_ref};
+
+  for (const Obs& recorded : observations) {
+    const std::vector<double> temperatures =
+        recorded.has_temperature
+            ? representatives(recorded.temperature, temperature_half_width,
+                              temperature_thresholds, -100.0, 200.0)
+            : std::vector<double>{0.0};
+    const std::vector<double> percentages =
+        recorded.has_percent
+            ? representatives(recorded.percent, charge_half_width, percent_thresholds, 0.0, 100.0)
+            : std::vector<double>{0.0};
+
+    ObjectiveEnvelope next[2]{};
+    unsigned action_mask = 0;
+    for (int cooling_index = 0; cooling_index < 2; ++cooling_index) {
+      if (!reachable[cooling_index].reachable) {
+        continue;
+      }
+      for (const double temperature : temperatures) {
+        for (const double percent : percentages) {
+          Obs perturbed = recorded;
+          if (recorded.has_temperature) {
+            perturbed.temperature = temperature;
+          }
+          if (recorded.has_percent) {
+            perturbed.percent = percent;
+          }
+          bool cooling = cooling_index != 0;
+          const Decision decision = decide(policy, perturbed, cooling);
+          action_mask |= 1U << decision.action;
+          const bool running = decision.action != kStop;
+          double hot_rate = 0.0;
+          if (running && perturbed.has_temperature) {
+            const double excess = perturbed.temperature - hot_ref;
+            if (excess > 0.0) {
+              hot_rate = excess;
+            }
+          }
+          const double low_rate =
+              running && perturbed.source == kBattery && perturbed.has_percent &&
+                      perturbed.percent <= low_ref
+                  ? 1.0
+                  : 0.0;
+          update_envelope(next[cooling ? 1 : 0], reachable[cooling_index], decision,
+                          recorded.duration_s, hot_rate, low_rate);
+        }
+      }
+    }
+
+    if (action_mask != 0 && (action_mask & (action_mask - 1U)) == 0) {
+      result.stable_seconds += recorded.duration_s;
+      ++result.stable_samples;
+    } else {
+      result.ambiguous_seconds += recorded.duration_s;
+      ++result.ambiguous_samples;
+    }
+    reachable[0] = next[0];
+    reachable[1] = next[1];
+  }
+
+  bool first = true;
+  for (const ObjectiveEnvelope& envelope : reachable) {
+    if (!envelope.reachable) {
+      continue;
+    }
+    if (first) {
+      result.minimum_run = envelope.minimum_run;
+      result.maximum_run = envelope.maximum_run;
+      result.minimum_hot = envelope.minimum_hot;
+      result.maximum_hot = envelope.maximum_hot;
+      result.minimum_low = envelope.minimum_low;
+      result.maximum_low = envelope.maximum_low;
+      first = false;
+    } else {
+      result.minimum_run = std::min(result.minimum_run, envelope.minimum_run);
+      result.maximum_run = std::max(result.maximum_run, envelope.maximum_run);
+      result.minimum_hot = std::min(result.minimum_hot, envelope.minimum_hot);
+      result.maximum_hot = std::max(result.maximum_hot, envelope.maximum_hot);
+      result.minimum_low = std::min(result.minimum_low, envelope.minimum_low);
+      result.maximum_low = std::max(result.maximum_low, envelope.maximum_low);
+    }
+  }
+  return result;
+}
+
 void print_row(const Row& row) {
   std::printf("R %a %a %a %a %a %a %" PRId64 " %" PRId64 " %016" PRIx64 "\n",
               row.action_seconds[kFull], row.action_seconds[kGentle], row.action_seconds[kStop],
               row.run_seconds, row.hot_degc_seconds, row.low_battery_seconds,
               row.action_transitions, row.decision_transitions, row.checksum);
+}
+
+void print_sensitivity_row(const SensitivityRow& row) {
+  std::printf("S %a %a %a %a %a %a %a %a %" PRId64 " %" PRId64 "\n", row.minimum_run,
+              row.maximum_run, row.minimum_hot, row.maximum_hot, row.minimum_low,
+              row.maximum_low, row.stable_seconds, row.ambiguous_seconds, row.stable_samples,
+              row.ambiguous_samples);
 }
 
 [[noreturn]] void fail(const char* message) {
@@ -295,8 +480,10 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (require_token("magic") != "TGK") {
-    fail("input does not start with the TGK magic token");
+  const std::string magic = require_token("magic");
+  const bool sensitivity_mode = magic == "TGS";
+  if (magic != "TGK" && !sensitivity_mode) {
+    fail("input does not start with the TGK or TGS magic token");
   }
   if (parse_int(require_token("protocol version"), "protocol version") != kProtocolVersion) {
     std::fprintf(stderr, "train-guard-kernel: unsupported protocol version\n");
@@ -304,11 +491,30 @@ int main(int argc, char** argv) {
   }
   const std::int64_t policy_count = parse_int(require_token("policy count"), "policy count");
   const std::int64_t obs_count = parse_int(require_token("observation count"), "observation count");
-  const bool emit_actions = parse_flag(require_token("emit_actions"), "emit_actions");
+  const bool emit_actions =
+      sensitivity_mode ? false : parse_flag(require_token("emit_actions"), "emit_actions");
   const double hot_ref = parse_double(require_token("hot_ref"), "hot_ref");
   const double low_ref = parse_double(require_token("low_ref"), "low_ref");
+  const double temperature_half_width =
+      sensitivity_mode ? parse_double(require_token("temperature_half_width"),
+                                      "temperature_half_width")
+                       : 0.0;
+  const double charge_half_width =
+      sensitivity_mode
+          ? parse_double(require_token("charge_half_width"), "charge_half_width")
+          : 0.0;
   if (policy_count < 1 || obs_count < 1) {
     fail("policy and observation counts must be at least 1");
+  }
+  if (!std::isfinite(hot_ref) || !std::isfinite(low_ref) ||
+      !std::isfinite(temperature_half_width) || !std::isfinite(charge_half_width) ||
+      temperature_half_width < 0.0 || charge_half_width < 0.0) {
+    fail("references must be finite and uncertainty half-widths finite and non-negative");
+  }
+  if (sensitivity_mode &&
+      (hot_ref < -100.0 || hot_ref > 200.0 || low_ref < 0.0 || low_ref > 100.0 ||
+       temperature_half_width > 300.0 || charge_half_width > 100.0)) {
+    fail("sensitivity references or half-widths are outside the supported domain");
   }
 
   std::vector<Policy> policies;
@@ -368,7 +574,7 @@ int main(int argc, char** argv) {
     fail("unexpected trailing input");
   }
 
-  std::printf("TGK %d OK\n", kProtocolVersion);
+  std::printf("%s %d OK\n", sensitivity_mode ? "TGS" : "TGK", kProtocolVersion);
 
   // emit_actions responses carry one byte per observation per policy, so
   // that path streams sequentially instead of buffering every string.
@@ -378,7 +584,44 @@ int main(int argc, char** argv) {
   }
   worker_count = std::min(worker_count, policies.size());
 
-  if (worker_count <= 1) {
+  if (sensitivity_mode && worker_count <= 1) {
+    for (const Policy& policy : policies) {
+      print_sensitivity_row(evaluate_sensitivity(policy, observations, hot_ref, low_ref,
+                                                 temperature_half_width, charge_half_width));
+    }
+  } else if (sensitivity_mode) {
+    std::vector<SensitivityRow> rows(policies.size());
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    const std::size_t chunk = (policies.size() + worker_count - 1) / worker_count;
+    try {
+      for (std::size_t worker = 0; worker < worker_count; ++worker) {
+        const std::size_t begin = worker * chunk;
+        const std::size_t end = std::min(begin + chunk, policies.size());
+        if (begin >= end) {
+          break;
+        }
+        workers.emplace_back([&policies, &observations, &rows, hot_ref, low_ref,
+                              temperature_half_width, charge_half_width, begin, end] {
+          for (std::size_t index = begin; index < end; ++index) {
+            rows[index] = evaluate_sensitivity(policies[index], observations, hot_ref, low_ref,
+                                               temperature_half_width, charge_half_width);
+          }
+        });
+      }
+    } catch (...) {
+      for (std::thread& worker : workers) {
+        worker.join();
+      }
+      fail("could not start worker threads");
+    }
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
+    for (const SensitivityRow& row : rows) {
+      print_sensitivity_row(row);
+    }
+  } else if (worker_count <= 1) {
     std::string actions;
     if (emit_actions) {
       actions.resize(static_cast<std::size_t>(obs_count));

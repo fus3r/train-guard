@@ -9,7 +9,7 @@ import pytest
 from trainguard import cli
 from trainguard.config import ConfigError, PolicyConfig
 from trainguard.native import KernelRow
-from trainguard.robustness import SensitivityBounds, SensitivityResult
+from trainguard.robustness import SensitivityBounds, SensitivityResult, analyze_sensitivity
 from trainguard.simulation import load_trace
 from trainguard.sweep import (
     SweepError,
@@ -295,6 +295,27 @@ def test_sweep_rejects_unavailable_or_invalid_engines(monkeypatch):
 
     monkeypatch.setattr("trainguard.sweep.find_kernel", lambda: Path("nominal-kernel"))
     monkeypatch.setattr("trainguard.sweep.run_kernel", nominal_kernel)
+
+    def sensitivity_kernel(
+        _kernel, policies, kernel_observations, timestamps, bounds, **references
+    ):
+        durations = [
+            (timestamps[index + 1] - timestamps[index]).total_seconds()
+            for index in range(len(timestamps) - 1)
+        ] + [0.0]
+        return [
+            analyze_sensitivity(
+                policy,
+                kernel_observations,
+                durations,
+                bounds,
+                hot_ref_c=references["hot_ref_c"],
+                low_battery_ref_pct=references["low_battery_ref_pct"],
+            )
+            for policy in policies
+        ]
+
+    monkeypatch.setattr("trainguard.sweep.run_sensitivity_kernel", sensitivity_kernel)
     bounded = run_sweep(
         PolicyConfig(),
         grid,
@@ -304,4 +325,5 @@ def test_sweep_rejects_unavailable_or_invalid_engines(monkeypatch):
     )
     assert bounded["engine"] == "native"
     assert bounded["kernel_verified_against_reference"] is True
-    assert bounded["uncertainty"]["engine"] == "python"
+    assert bounded["uncertainty"]["engine"] == "native"
+    assert bounded["uncertainty"]["kernel_verified_against_reference"] is True
