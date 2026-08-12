@@ -8,39 +8,29 @@ Power-aware supervision for one long-running job.
 
 `train-guard` watches a laptop's power source, charge level and available
 battery temperature, then applies `full`, `gentle` or `stop` to one named
-process tree. The same policy can be replayed against a recorded trace before
-it controls a live job.
+process tree. Replay the same policy against a recorded trace before allowing
+it to control a live job.
 
 Train Guard is a workload policy, not a hardware safety controller. It does
 not set a charge limit or predict battery life, temperature, energy use or
 throughput.
 
-## Install 0.4.0
+## Install
 
-Install the published package with `pipx`:
+Python 3.9 or later is required.
 
 ```bash
-pipx install "train-guard==0.4.0"
+pipx install train-guard
 train-guard doctor
 ```
 
-If the PyPI publication has not happened yet, validate the tagged source in a
-fresh checkout instead:
+`doctor` reports which sensors the machine exposes. Missing battery
+temperature is common on some systems, especially Windows, and disables the
+temperature rules for that observation.
 
-```bash
-git clone --branch v0.4.0 --depth 1 \
-  https://github.com/fus3r/train-guard.git
-cd train-guard
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install .
-train-guard doctor
-```
+## First job
 
-Missing battery temperature is common on some systems, especially Windows,
-and disables temperature rules for that observation.
-
-## First disposable job
+Start with a disposable command:
 
 ```bash
 train-guard config --init
@@ -51,68 +41,36 @@ train-guard events quickstart --limit 10
 train-guard stop quickstart
 ```
 
-Without `--kill`, `stop` releases changes owned by Train Guard and detaches.
+`stop` releases changes owned by Train Guard and detaches. Add `--kill` only
+when the worker process tree should also end.
 
-## Replay and bounded sweeps
+## Continue
 
-The source archive and tagged checkout include an example trace and policy
-files. From that checkout, a `pipx` or wheel installation can replay them
-without controlling a process.
+- [Documentation](https://train-guard.readthedocs.io/en/latest/)
+- [Getting started](https://train-guard.readthedocs.io/en/latest/getting-started/)
+- [Architecture and process lifecycle](https://train-guard.readthedocs.io/en/latest/architecture/)
+- [Failure recovery](https://train-guard.readthedocs.io/en/latest/failure-model/)
+- [Offline replay and bounded sensitivity](https://train-guard.readthedocs.io/en/latest/policy-replay/)
+- [Policy sweep and limitations](https://train-guard.readthedocs.io/en/latest/policy-sweep/)
 
-Create a small policy grid as `grid.json`:
+Development setup and validation commands are in
+[CONTRIBUTING.md](https://github.com/fus3r/train-guard/blob/main/CONTRIBUTING.md).
+Report vulnerabilities through the
+[private security channel](https://github.com/fus3r/train-guard/security/policy),
+not a public issue.
 
-```json
-{"temp_pause_c": [40, 42, 44], "run_on_battery": [true, false]}
-```
+## Central limits
 
-Then run the nominal and bounded analyses:
+- Temperature availability depends on hardware and drivers.
+- `gentle` is a scheduling hint, not a power cap.
+- Match attachment can include unrelated commands containing the same text;
+  prefer a PID when available.
+- An application still needs durable checkpoints for reboot recovery.
+- Replay and sweep hold the recorded trace fixed. Their outputs are exposure
+  accounting, not causal or physical predictions.
 
-```bash
-train-guard simulate examples/power-trace.jsonl \
-  --config config.example.json
-train-guard simulate examples/power-trace.jsonl \
-  --config config.example.json \
-  --temperature-uncertainty-c 0.5 \
-  --charge-uncertainty-pct 1 --json
-train-guard sweep examples/power-trace.jsonl \
-  --grid grid.json --engine python \
-  --temperature-uncertainty-c 0.5 \
-  --charge-uncertainty-pct 1 --json
-```
+Train Guard runs on macOS, Linux and Windows. Platform-specific actions and
+limitations are documented in the
+[platform guide](https://train-guard.readthedocs.io/en/latest/platforms/).
 
-The uncertainty widths are supplied by the user; Train Guard does not infer
-sensor accuracy or attach a confidence level. Exactness is limited to the
-current threshold policy and the finite IEEE-754 binary64 representatives in
-the declared box. The action-change report gives divergence context, not a
-complete witness or certificate. Bounded-sweep survivors form a conservative
-outer enclosure, not an exact robust Pareto set.
-
-Replay and sweep re-weight an exogenous recorded trace. They do not model how a
-different action would have changed later temperature, charge, performance or
-energy use.
-
-For large source-checkout sweeps, the optional C++17 kernel keeps nominal
-`TGK 1` and bounded `TGS 1` as separate protocols:
-
-```bash
-cmake -S native -B native/build
-cmake --build native/build --config Release
-python tools/bench_sweep.py \
-  --kernel native/build/train-guard-kernel --sensitivity
-```
-
-Python remains the reference, and native rows are accepted only after the
-baseline agrees bit for bit. The wheel is pure Python and does not ship the
-kernel. Benchmark timings are hardware-specific and are not release gates.
-
-## Documentation for this tag
-
-- [Architecture and lifecycle](https://github.com/fus3r/train-guard/blob/v0.4.0/docs/architecture.md)
-- [Failure recovery](https://github.com/fus3r/train-guard/blob/v0.4.0/docs/failure-model.md)
-- [Offline replay](https://github.com/fus3r/train-guard/blob/v0.4.0/docs/policy-replay.md)
-- [Replay sensitivity](https://github.com/fus3r/train-guard/blob/v0.4.0/docs/replay-sensitivity.md)
-- [Policy sweep](https://github.com/fus3r/train-guard/blob/v0.4.0/docs/policy-sweep.md)
-- [Changelog](https://github.com/fus3r/train-guard/blob/v0.4.0/CHANGELOG.md)
-- [MIT license](https://github.com/fus3r/train-guard/blob/v0.4.0/LICENSE)
-
-The later documentation portal is built from these canonical Markdown files.
+MIT licensed.

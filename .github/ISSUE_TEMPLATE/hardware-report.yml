@@ -1,0 +1,108 @@
+name: Hardware report
+description: Report a successful or failed Train Guard trial on a real machine.
+title: "[hardware]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use a disposable, non-critical job when reproducing process-control behavior.
+        Remove user paths, private command arguments, environment variables and sensitive journal content.
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - Successful trial
+        - Failed trial
+        - Unexpected or unclear result
+    validations:
+      required: true
+
+  - type: input
+    id: train_guard_version
+    attributes:
+      label: Train Guard version
+      description: Paste the output of `train-guard --version`.
+      placeholder: train-guard 0.4.0
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Include the OS name, version and architecture.
+      placeholder: macOS 15.7.7, arm64
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: Python 3.13.7
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - pipx from PyPI
+        - wheel or source archive
+        - development checkout
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Redacted doctor output
+      description: Run `train-guard doctor`. Remove user paths and other private values before pasting.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: sensors
+    attributes:
+      label: Sensors available
+      description: State whether power source, charge percentage and battery temperature were present.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario
+      description: Describe the disposable command, policy action and lifecycle steps you exercised.
+      placeholder: Ran a two-minute Python sleep job, inspected status and events, then detached with stop.
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed result
+      description: Include the action, terminal event and any error. Do not attach a full private journal.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result if different
+      description: Leave blank for a successful trial.
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety and redaction
+      options:
+        - label: I used a non-critical job or did not run live process control.
+          required: true
+        - label: I removed secrets, private paths, private commands and sensitive journal content.
+          required: true

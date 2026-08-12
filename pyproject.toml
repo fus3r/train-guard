@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "train-guard"
-version = "0.4.0"
+version = "0.4.1.dev0"
 description = "Power-aware process supervision for long-running local compute jobs."
 readme = "README.md"
 license = "MIT"
@@ -36,6 +36,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/fus3r/train-guard"
+Documentation = "https://train-guard.readthedocs.io/en/latest/"
 Issues = "https://github.com/fus3r/train-guard/issues"
 Source = "https://github.com/fus3r/train-guard"
 
