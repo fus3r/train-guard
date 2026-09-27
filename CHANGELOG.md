@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Record the agent session that starts a job. `run` and `attach` take
+  `--agent ID` and otherwise read `CLAUDE_CODE_SESSION_ID`, then
+  `CODEX_THREAD_ID`, which Claude Code and Codex export to the commands they
+  run. Restart specifications keep the original agent.
+- Let the owner exempt an agent: a job whose agent is listed in
+  `ignored-agents` in the state directory runs `full` with the reason
+  `agent_ignored`, whatever the power and temperature, and follows the policy
+  again once the agent leaves the list. The supervisor rereads the list on
+  every cycle. An unreadable list exempts no agent and is reported. Replay,
+  sweeps and the native kernel keep their outputs and protocols.
+- `status` shows each guard's agent and the ignored agents. `status --json`
+  adds `ignored_agents`, and each guard in `status --json` and `list --json`
+  gains `agent` and `agent_ignored`.
+
 ## 0.4.0 - 2026-08-12
 
 - Make `stop --kill` wait for termination, escalate survivors and retain

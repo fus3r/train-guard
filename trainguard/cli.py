@@ -54,6 +54,8 @@ if __package__:
         PersistenceSpec,
         StateError,
         atomic_json_write,
+        read_ignored_agents,
+        validate_agent,
         validate_job_name,
     )
     from .supervisor import (
@@ -91,6 +93,8 @@ else:  # Keep direct execution from a checkout working.
         PersistenceSpec,
         StateError,
         atomic_json_write,
+        read_ignored_agents,
+        validate_agent,
         validate_job_name,
     )
     from supervisor import (
@@ -421,6 +425,48 @@ def _restart_on_login(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "restart_on_login", getattr(args, "persist", False)))
 
 
+# Claude Code and Codex export their session id to the commands they run.
+_AGENT_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+
+
+def _job_agent(args: argparse.Namespace) -> Optional[str]:
+    """Return the agent session a new job belongs to.
+
+    An explicit ``--agent`` wins and must be valid; an empty one records no
+    agent. Otherwise the job belongs to the session running this command. A
+    malformed environment value records no agent instead of blocking a launch.
+    """
+
+    explicit = getattr(args, "agent", None)
+    if explicit is not None:
+        return validate_agent(explicit) if explicit else None
+    for variable in _AGENT_VARIABLES:
+        value = os.environ.get(variable)
+        if value:
+            try:
+                return validate_agent(value)
+            except StateError:
+                return None
+    return None
+
+
+def _ignored_agents(paths: AppPaths) -> frozenset[str]:
+    """Read the owner's ignore list. ``audit_state`` reports an unreadable one."""
+
+    try:
+        return read_ignored_agents(paths.ignored_agents)
+    except StateError:
+        return frozenset()
+
+
+def _print_ignored_note(paths: AppPaths, agent: Optional[str]) -> None:
+    if agent is not None and agent in _ignored_agents(paths):
+        print(
+            f"[train-guard] the owner ignores agent {agent}: this job runs at full speed, "
+            "whatever the power and temperature"
+        )
+
+
 def _working_directory(value: Optional[str]) -> str:
     path = Path(value or os.getcwd()).expanduser()
     if not path.is_dir():
@@ -463,10 +509,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd = cmd[1:]
     if not cmd:
         sys.stderr.write(
-            "usage: train-guard run [--name N] [--restart-on-login] [--cwd DIR] -- <command...>\n"
+            "usage: train-guard run [--name N] [--restart-on-login] [--cwd DIR] [--agent ID] "
+            "-- <command...>\n"
         )
         return 2
     name = validate_job_name(args.name or f"job-{time.strftime('%H%M%S')}")
+    agent = _job_agent(args)
     cwd = _working_directory(args.cwd)
     restart = _restart_on_login(args)
     log = paths.logs / f"{name}.log"
@@ -481,7 +529,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         try:
             job = _spawn_detached(cmd, logfile=log, cwd=cwd)
             root = _capture_identity(job.pid, "job")
-            store.write_spec(JobSpec.launched(name, root, log))
+            store.write_spec(JobSpec.launched(name, root, log, agent))
             if restart:
                 store.write_persistence(
                     PersistenceSpec(
@@ -489,6 +537,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         name=name,
                         cwd=cwd,
                         argv=tuple(cmd),
+                        agent=agent,
                     )
                 )
             guard = _start_supervisor(store, name)
@@ -507,6 +556,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     tag = "  (restarts at next login)" if restart else ""
     print(f"[train-guard] '{name}': job pid={job.pid}  guard pid={guard.pid}  out={log}{tag}")
     print(f"[train-guard] policy: {_policy_line(cfg)}   |   train-guard status")
+    _print_ignored_note(paths, agent)
     return 0
 
 
@@ -516,7 +566,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
     cfg = load_policy(paths.config)
     if not args.match and not args.pid:
         sys.stderr.write(
-            'usage: train-guard attach --match "<pattern>" [--name N] '
+            'usage: train-guard attach --match "<pattern>" [--name N] [--agent ID] '
             '[--restart-on-login --start "<cmd>"]   (or --pid PID)\n'
         )
         return 2
@@ -528,12 +578,17 @@ def cmd_attach(args: argparse.Namespace) -> int:
         )
         return 2
     name = validate_job_name(args.name or f"attach-{time.strftime('%H%M%S')}")
+    agent = _job_agent(args)
     cwd = _working_directory(args.cwd)
     if args.pid:
-        spec = JobSpec.attached_pid(name, _capture_identity(int(args.pid), "attached"))
+        spec = JobSpec.attached_pid(
+            name,
+            _capture_identity(int(args.pid), "attached"),
+            agent,
+        )
         excluded_identity = None
     else:
-        spec = JobSpec.attached_pattern(name, args.match)
+        spec = JobSpec.attached_pattern(name, args.match, agent)
         excluded_identity = _capture_identity(os.getpid(), "launcher")
     with store.lock_name(name):
         _ensure_name_available(store, name)
@@ -552,6 +607,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
                         cwd=cwd,
                         pattern=args.match,
                         start=args.start,
+                        agent=agent,
                     )
                 )
             guard = _start_supervisor(
@@ -572,6 +628,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
     tag = "  (restart/reattach configured for next login)" if restart else ""
     print(f"[train-guard] attached '{name}'  guard pid={guard.pid}{tag}")
     print(f"[train-guard] policy: {_policy_line(cfg)}   |   train-guard status")
+    _print_ignored_note(paths, agent)
     return 0
 
 
@@ -582,6 +639,7 @@ def _agent_installed() -> bool:
 def _guard_payloads(store: JobStore) -> tuple[list[dict[str, Any]], list[str]]:
     guards: list[dict[str, Any]] = []
     state_errors = store.audit_state()
+    ignored = _ignored_agents(store.paths)
     for spec in store.list_specs():
         guard_error = None
         try:
@@ -613,6 +671,8 @@ def _guard_payloads(store: JobStore) -> tuple[list[dict[str, Any]], list[str]]:
             "mode": spec.mode,
             "guard": guard,
             "runtime": runtime,
+            "agent": spec.agent,
+            "agent_ignored": spec.agent is not None and spec.agent in ignored,
         }
         if runtime_error:
             item["runtime_error"] = runtime_error
@@ -644,6 +704,7 @@ def _status_payload(paths: AppPaths) -> dict[str, Any]:
         "policy": config.to_dict(),
         "policy_error": config_error,
         "guards": guards,
+        "ignored_agents": sorted(_ignored_agents(paths)),
         "login_agent_installed": _agent_installed(),
         "restart_specs": restart_specs,
         "persistence_errors": persistence_errors,
@@ -710,6 +771,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"  {item['name']} [{item['mode']}]  guard={alive} "
             f"(pid {item['guard']['pid']})  state={state}  pids={pids}"
         )
+        if item["agent"]:
+            ignored = "  (ignored: runs at full speed)" if item["agent_ignored"] else ""
+            print(f"    agent: {item['agent']}{ignored}")
         if item["guard"].get("error"):
             print(f"    guard state invalid: {item['guard']['error']}")
         if item.get("runtime_error"):
@@ -719,6 +783,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"    last decision: {decision['action']} ({decision['reason']})")
         if runtime.get("config_error"):
             print(f"    config rejected: {runtime['config_error']}")
+    print()
+    print("ignored agents (their jobs run at full speed)")
+    for agent in payload["ignored_agents"]:
+        print(f"  {agent}")
+    if not payload["ignored_agents"]:
+        print("  none; the owner chooses which agents to ignore")
     if payload["state_errors"]:
         print()
         print("state issues")
@@ -759,6 +829,8 @@ def cmd_list(args: argparse.Namespace) -> int:
                     "mode": item["mode"],
                     "alive": item["guard"]["alive"],
                     "state": (item["runtime"] or {}).get("state", "starting"),
+                    "agent": item["agent"],
+                    "agent_ignored": item["agent_ignored"],
                 }
                 for item in guards
             ]
@@ -1309,6 +1381,8 @@ def cmd_restart_persisted(_args: argparse.Namespace) -> int:
                     print(f"[restart] '{name}' has stale state; run recover before restarting")
                     failures += 1
                 continue
+            # An empty agent records none: the restarted job keeps the agent
+            # that started it, never the session running this command.
             if spec.mode == "run":
                 result = cmd_run(
                     argparse.Namespace(
@@ -1316,6 +1390,7 @@ def cmd_restart_persisted(_args: argparse.Namespace) -> int:
                         restart_on_login=True,
                         cwd=spec.cwd,
                         cmd=list(spec.argv),
+                        agent=spec.agent or "",
                         _preserve_persistence=True,
                     )
                 )
@@ -1341,6 +1416,7 @@ def cmd_restart_persisted(_args: argparse.Namespace) -> int:
                             match=pattern,
                             pid=None,
                             start=start,
+                            agent=spec.agent or "",
                             _preserve_persistence=True,
                         )
                     )
@@ -1385,6 +1461,17 @@ def cmd_uninstall_agent(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_agent_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--agent",
+        metavar="ID",
+        help=(
+            "agent session this job belongs to (default: CLAUDE_CODE_SESSION_ID, "
+            'then CODEX_THREAD_ID; "" records none)'
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="train-guard",
@@ -1395,6 +1482,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="launch + supervise a new job")
     r.add_argument("--name")
+    _add_agent_argument(r)
     rg = r.add_mutually_exclusive_group()
     rg.add_argument(
         "--restart-on-login",
@@ -1415,6 +1503,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--name")
     a.add_argument("--match")
     a.add_argument("--pid", type=int)
+    _add_agent_argument(a)
     ag = a.add_mutually_exclusive_group()
     ag.add_argument(
         "--restart-on-login",

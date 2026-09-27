@@ -118,10 +118,16 @@ There is one supervisor per named job. Each cycle follows the same sequence:
 2. Resolve the current root and descendant processes.
 3. Reload the policy if its content changed.
 4. Read one battery snapshot and the available pack temperature.
-5. Pass the immutable observation to the policy state machine.
+5. Pass the immutable observation to the policy state machine, unless the
+   owner lists the job's agent in `ignored-agents`, which selects `full` with
+   the reason `agent_ignored` and clears the cooldown.
 6. Apply `full`, `gentle` or `stop` to the resolved processes.
 7. Atomically replace the runtime snapshot.
 8. Append an event when the decision, reason or observation changes.
+
+The `agent_ignored` reason exists only in the live supervisor. The policy
+engine, replay, sweeps and the native kernel never produce it, so their
+outputs and protocols do not depend on the ignore list.
 
 The event journal is transition-oriented. It does not append the same decision
 every polling interval. A handled stop, worker exit, shutdown or failure appends
@@ -215,7 +221,8 @@ The root defaults to `~/.train-guard` and can be changed with
 | Path | Contents | Lifetime |
 |---|---|---|
 | `config.json` | validated policy values | until removed |
-| `run/NAME.meta.json` | job mode and root or match data | active or stale job |
+| `ignored-agents` | agent ids the owner exempts from the policy | until removed |
+| `run/NAME.meta.json` | job mode, root or match data and optional agent | active or stale job |
 | `run/NAME.guard.json` | supervisor PID and creation time | live supervisor |
 | `run/NAME.runtime.json` | last action, observation and owned process changes | active or stale job |
 | `run/NAME.ready.json` | child-written supervisor identity | startup handshake only |

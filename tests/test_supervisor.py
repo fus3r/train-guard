@@ -3,11 +3,13 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import psutil
 import pytest
 
 from trainguard import cli
+from trainguard.journal import EventJournal
 from trainguard.model import Action, Observation, PowerSource, ProcessIdentity, utc_now
 from trainguard.processes import (
     ApplyReport,
@@ -498,3 +500,125 @@ def test_orphan_recovery_keeps_denied_identity_for_retry(
         assert not store.runtime_path("orphan").exists()
     finally:
         _resume_and_terminate(worker)
+
+
+class RecordingController:
+    """Report one live target and record the actions applied to it."""
+
+    def __init__(self, live_cycles=None):
+        self.live_cycles = live_cycles
+        self.actions = []
+
+    @property
+    def owned_suspensions(self):
+        return ()
+
+    @property
+    def tuned_processes(self):
+        return ()
+
+    def resolve(self, _spec):
+        alive = self.live_cycles is None or len(self.actions) < self.live_cycles
+        return TargetSnapshot((SimpleNamespace(pid=321),) if alive else (), alive)
+
+    def apply(self, action, processes):
+        self.actions.append(action)
+        return ApplyReport(targeted=len(tuple(processes)))
+
+    def release_owned(self):
+        return ApplyReport(targeted=0)
+
+
+def _warm_battery():
+    # Between the resume and pause thresholds: only an active cooldown pauses
+    # for temperature here, so the decision reason shows whether one remains.
+    return SimpleNamespace(
+        sample=lambda: Observation(PowerSource.BATTERY, 60.0, 40.0, False, utc_now())
+    )
+
+
+def test_ignored_agent_runs_full_until_the_owner_removes_it(app_paths):
+    atomic_json_write(app_paths.config, {"poll": 0.1})
+    app_paths.ignored_agents.write_text(
+        "# owner's choice\nclaude-session-1  # Claude, warden\n", encoding="utf-8"
+    )
+    spec = JobSpec.launched(
+        "training",
+        ProcessIdentity(321, 1.0),
+        app_paths.logs / "training.log",
+        agent="claude-session-1",
+    )
+    store = JobStore(app_paths)
+    store.write_spec(spec)
+    controller = RecordingController()
+    supervisor = Supervisor(app_paths, spec, sensors=_warm_battery(), controller=controller)
+    # As if an earlier thermal pause of this job had not ended yet.
+    supervisor.policy.cooling = True
+    thread, result = _run_in_thread(supervisor)
+    try:
+        _wait_until(
+            lambda: (
+                (store.read_runtime("training") or {}).get("decision", {}).get("reason")
+                == "agent_ignored"
+            )
+        )
+        runtime = store.read_runtime("training")
+        assert runtime is not None
+        assert runtime["state"] == "full"
+        assert runtime["decision"] == {
+            "action": "full",
+            "reason": "agent_ignored",
+            "cooling": False,
+        }
+        assert runtime["cooling"] is False
+        assert controller.actions[-1] is Action.FULL
+
+        app_paths.ignored_agents.write_text("# owner's choice\n", encoding="utf-8")
+        _wait_until(
+            lambda: (
+                (store.read_runtime("training") or {}).get("decision", {}).get("reason")
+                == "battery_disabled"
+            )
+        )
+        # The cleared cooldown does not come back: the policy starts fresh.
+        assert (store.read_runtime("training") or {})["decision"] == {
+            "action": "stop",
+            "reason": "battery_disabled",
+            "cooling": False,
+        }
+        assert controller.actions[-1] is Action.STOP
+    finally:
+        store.request_stop("training", False)
+        thread.join(timeout=5)
+
+    assert result == [0]
+    decisions = [
+        event["message"]
+        for event in EventJournal(app_paths, "training").read()
+        if event["event"] == "decision"
+    ]
+    assert decisions[0].startswith("-> full (agent_ignored; power=battery")
+    assert decisions[-1].startswith("-> stop (battery_disabled; power=battery")
+
+
+def test_unreadable_ignore_list_applies_the_policy_and_warns_once(app_paths):
+    atomic_json_write(app_paths.config, {"poll": 0.1})
+    # The path exists but cannot be read as a list.
+    app_paths.ignored_agents.mkdir()
+    spec = JobSpec.launched(
+        "training",
+        ProcessIdentity(321, 1.0),
+        app_paths.logs / "training.log",
+        agent="claude-session-1",
+    )
+    JobStore(app_paths).write_spec(spec)
+    controller = RecordingController(live_cycles=3)
+    supervisor = Supervisor(app_paths, spec, sensors=_warm_battery(), controller=controller)
+    supervisor._install_signal_handlers = lambda: None
+
+    assert supervisor.run() == 0
+
+    assert controller.actions == [Action.STOP] * 3
+    events = [event["event"] for event in EventJournal(app_paths, "training").read()]
+    assert events.count("ignored_agents_unreadable") == 1
+    assert any("ignored agents" in error for error in JobStore(app_paths).audit_state())

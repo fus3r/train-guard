@@ -5,7 +5,7 @@ import pytest
 
 from trainguard import cli
 from trainguard.model import Observation, PowerSource, ProcessIdentity, utc_now
-from trainguard.state import JobSpec, JobStore, atomic_json_write
+from trainguard.state import JobSpec, JobStore, PersistenceSpec, atomic_json_write
 
 
 def pin_sensors(monkeypatch, **readings):
@@ -307,3 +307,124 @@ def test_keyboard_interrupt_has_a_distinct_exit_code(monkeypatch, capsys):
     monkeypatch.setattr(cli, "cmd_doctor", interrupt)
     assert cli.main(["doctor"]) == 130
     assert "interrupted" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("environment", "flag", "expected"),
+    [
+        (
+            {"CLAUDE_CODE_SESSION_ID": "claude-1", "CODEX_THREAD_ID": "codex-1"},
+            [],
+            "claude-1",
+        ),
+        ({"CODEX_THREAD_ID": "codex-1"}, [], "codex-1"),
+        ({"CLAUDE_CODE_SESSION_ID": "claude-1"}, ["--agent", "chosen-agent"], "chosen-agent"),
+        ({"CLAUDE_CODE_SESSION_ID": "claude-1"}, ["--agent", ""], None),
+        # A malformed session id must not block the launch.
+        ({"CLAUDE_CODE_SESSION_ID": "not an id"}, [], None),
+    ],
+)
+def test_run_records_the_agent_that_launched_the_job(
+    environment,
+    flag,
+    expected,
+    fake_spawn,
+    monkeypatch,
+    app_paths,
+):
+    for variable, value in environment.items():
+        monkeypatch.setenv(variable, value)
+
+    assert cli.main(["run", "--name", "training", *flag, "--", "python", "train.py"]) == 0
+    assert JobStore(app_paths).read_spec("training").agent == expected
+
+
+def test_attach_records_the_agent_and_rejects_an_invalid_explicit_one(
+    fake_spawn,
+    monkeypatch,
+    app_paths,
+    capsys,
+):
+    monkeypatch.setenv("CODEX_THREAD_ID", "codex-1")
+    app_paths.ignored_agents.write_text("codex-1\n", encoding="utf-8")
+    assert cli.main(["attach", "--match", "python train.py", "--name", "watch"]) == 0
+    assert JobStore(app_paths).read_spec("watch").agent == "codex-1"
+    # The agent learns that the owner exempts its job.
+    assert "the owner ignores agent codex-1" in capsys.readouterr().out
+
+    spawned = len(fake_spawn)
+    assert (
+        cli.main(["run", "--name", "bad", "--agent", "two words", "--", "python", "train.py"]) == 2
+    )
+    assert len(fake_spawn) == spawned
+    assert "agent ids" in capsys.readouterr().err
+
+
+def test_restart_persisted_keeps_the_agent_that_started_the_job(
+    fake_spawn,
+    monkeypatch,
+    app_paths,
+    tmp_path,
+):
+    # The login helper, or any other session, runs the restart.
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "restarting-session")
+    store = JobStore(app_paths)
+    store.write_persistence(
+        PersistenceSpec(
+            mode="run",
+            name="owned",
+            cwd=str(tmp_path),
+            argv=("python", "train.py"),
+            agent="claude-1",
+        )
+    )
+    store.write_persistence(
+        PersistenceSpec(mode="run", name="unowned", cwd=str(tmp_path), argv=("python", "eval.py"))
+    )
+
+    assert cli.main(["restart-persisted"]) == 0
+    assert store.read_spec("owned").agent == "claude-1"
+    assert store.read_spec("unowned").agent is None
+    assert store.read_persistence(store.persistence_path("owned")).agent == "claude-1"
+
+
+def test_status_and_list_report_each_agent_and_the_ignore_list(
+    app_paths,
+    monkeypatch,
+    capsys,
+):
+    pin_sensors(monkeypatch)
+    monkeypatch.setattr(cli, "_agent_installed", lambda: False)
+    store = JobStore(app_paths)
+    store.write_spec(JobSpec.attached_pattern("exempt", "python a.py", agent="claude-1"))
+    store.write_spec(JobSpec.attached_pattern("guarded", "python b.py", agent="codex-1"))
+    app_paths.ignored_agents.write_text("claude-1  # Claude, warden\n", encoding="utf-8")
+
+    assert cli.main(["status", "--json"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["ignored_agents"] == ["claude-1"]
+    assert {
+        (guard["name"], guard["agent"], guard["agent_ignored"]) for guard in status["guards"]
+    } == {
+        ("exempt", "claude-1", True),
+        ("guarded", "codex-1", False),
+    }
+
+    assert cli.main(["status"]) == 0
+    output = capsys.readouterr().out
+    assert "agent: claude-1  (ignored: runs at full speed)" in output
+    assert "agent: codex-1\n" in output
+
+    assert cli.main(["list", "--json"]) == 0
+    listing = {item["name"]: item for item in json.loads(capsys.readouterr().out)}
+    assert (listing["exempt"]["agent"], listing["exempt"]["agent_ignored"]) == ("claude-1", True)
+    assert (listing["guarded"]["agent"], listing["guarded"]["agent_ignored"]) == ("codex-1", False)
+
+    # An unreadable list exempts no one, as in the supervisor, and is reported.
+    app_paths.ignored_agents.unlink()
+    app_paths.ignored_agents.mkdir()
+    assert cli.main(["status", "--json"]) == 1
+    status = json.loads(capsys.readouterr().out)
+    assert status["ignored_agents"] == []
+    assert not any(guard["agent_ignored"] for guard in status["guards"])
+    assert any("cannot read the ignored agents" in error for error in status["state_errors"])

@@ -44,6 +44,17 @@ class DecisionReason(str, Enum):
     AC_POLICY = "ac_policy"
 
 
+class OverrideReason(str, Enum):
+    """Why the live supervisor set the policy's decision aside.
+
+    Only the supervisor produces these, never the policy engine, so offline
+    replay, sweeps and the native kernel, which mirrors ``DecisionReason``,
+    keep their outputs and protocols.
+    """
+
+    AGENT_IGNORED = "agent_ignored"
+
+
 @dataclass(frozen=True)
 class Observation:
     """One internally consistent power and thermal sample.
@@ -87,6 +98,22 @@ class PolicyDecision:
     action: Action
     reason: DecisionReason
     cooling: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action.value,
+            "reason": self.reason.value,
+            "cooling": self.cooling,
+        }
+
+
+@dataclass(frozen=True)
+class OverrideDecision:
+    """An action the supervisor applies in place of the policy's decision."""
+
+    action: Action
+    reason: OverrideReason
+    cooling: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
