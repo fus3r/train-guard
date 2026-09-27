@@ -444,14 +444,17 @@ class Supervisor:
                             f"SENSOR {warning}",
                         )
                     warned = observation.warnings
-                decision: Decision
+                # The policy decides every cycle, even for an ignored agent, so
+                # its thermal cooldown stays true to the pack: a job whose agent
+                # leaves the list stays paused until the pack has cooled.
+                policy_decision = self.policy.decide(config, observation)
+                decision: Decision = policy_decision
                 if self._agent_ignored():
-                    # Clearing the cooldown lets the policy start fresh once
-                    # the owner takes the agent off the list.
-                    self.policy.cooling = False
-                    decision = OverrideDecision(Action.FULL, OverrideReason.AGENT_IGNORED)
-                else:
-                    decision = self.policy.decide(config, observation)
+                    decision = OverrideDecision(
+                        Action.FULL,
+                        OverrideReason.AGENT_IGNORED,
+                        cooling=policy_decision.cooling,
+                    )
                 self._last_observation = observation
                 self._last_decision = decision
                 report = self.controller.apply(decision.action, processes)
@@ -469,6 +472,10 @@ class Supervisor:
                     observation.signature(),
                 )
                 if transition != self._last_transition:
+                    # An override keeps what the policy decided as evidence.
+                    evidence = (
+                        {} if decision is policy_decision else {"policy": policy_decision.to_dict()}
+                    )
                     self.journal.emit(
                         "decision",
                         f"-> {decision.action.value} "
@@ -477,6 +484,7 @@ class Supervisor:
                         decision=decision.to_dict(),
                         process_report=_report_payload(report),
                         pids=pids,
+                        **evidence,
                     )
                     self._last_transition = transition
                 self._shutdown.wait(config.poll)

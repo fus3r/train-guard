@@ -2,19 +2,25 @@
 
 ## Unreleased
 
-- Record the agent session that starts a job. `run` and `attach` take
-  `--agent ID` and otherwise read `CLAUDE_CODE_SESSION_ID`, then
-  `CODEX_THREAD_ID`, which Claude Code and Codex export to the commands they
-  run. Restart specifications keep the original agent.
+- Record the agent session that starts a job. `run` takes `--agent ID` and
+  otherwise reads `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, which
+  Claude Code and Codex export to the commands they run, skipping a malformed
+  value. `attach` records an agent only from `--agent`, since someone else
+  started the process it guards. Restart specifications keep the original
+  agent.
 - Let the owner exempt an agent: a job whose agent is listed in
   `ignored-agents` in the state directory runs `full` with the reason
-  `agent_ignored`, whatever the power and temperature, and follows the policy
-  again once the agent leaves the list. The supervisor rereads the list on
-  every cycle. An unreadable list exempts no agent and is reported. Replay,
-  sweeps and the native kernel keep their outputs and protocols.
-- `status` shows each guard's agent and the ignored agents. `status --json`
-  adds `ignored_agents`, and each guard in `status --json` and `list --json`
-  gains `agent` and `agent_ignored`.
+  `agent_ignored`, whatever the power and temperature. The policy still
+  evaluates every observation, so its thermal cooldown is kept, and decision
+  events record its own decision under `policy`. The supervisor rereads the
+  list on every cycle. The list is a UTF-8 regular file of at most 64 KiB,
+  with or without a byte order mark; an unreadable list exempts no agent,
+  and it and any invalid line are reported. Replay, sweeps and the native
+  kernel keep their outputs and protocols.
+- `status` shows each guard's agent and, once the list exists or a guard has an
+  agent, the ignored agents. `status --json` adds `ignored_agents`, and each
+  guard in `status --json` and `list --json` gains `agent` and
+  `agent_ignored`, true when the agent is listed.
 
 ## 0.4.0 - 2026-08-12
 

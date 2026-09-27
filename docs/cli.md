@@ -19,9 +19,11 @@ process after reboot. It does not restore memory or application state.
 `--agent ID` names the agent session the job belongs to. Without it, the job
 belongs to the session running the command: `CLAUDE_CODE_SESSION_ID`, then
 `CODEX_THREAD_ID`, which Claude Code and Codex export to the commands they run.
-`--agent ""` records none. An invalid `--agent` value exits with status 2
-before anything starts; an invalid environment value records no agent. The
-owner can exempt an agent's jobs from the policy; see
+When both are set, as when one agent runs inside the other's shell,
+`CLAUDE_CODE_SESSION_ID` wins; `--agent` chooses explicitly. `--agent ""`
+records none. An invalid `--agent` value exits with status 2 before anything
+starts; an invalid environment value is skipped. The owner can exempt an
+agent's jobs from the policy; see
 [ignored agents](configuration.md#ignored-agents).
 
 ### `attach`
@@ -34,8 +36,12 @@ train-guard attach --match TEXT --name NAME [--agent ID] [--start COMMAND]
 ```
 
 Prefer `--pid` when the intended process already has a stable PID. Match mode
-can include unrelated commands containing the same text. `--agent` works as
-for `run`.
+can include unrelated commands containing the same text.
+
+`attach` records an agent only from `--agent`. The guarded process was
+started by someone else, so the session running `attach` is not credited:
+otherwise an exempt session asked to guard another job, or every process a
+broad `--match` finds, would exempt that job too.
 
 ### `status`, `list` and `events`
 
@@ -45,9 +51,13 @@ train-guard list [--json]
 train-guard events NAME [--limit N] [--json]
 ```
 
-`status` includes the current sensor observation, policy, active supervisors,
-ignored agents and restart specifications. In `status --json` and `list --json`
-each guard reports its `agent`, or null, and `agent_ignored`. `events` reads
+`status` includes the current sensor observation, policy, active supervisors
+and restart specifications, and the ignored agents once the list exists or a
+guard has an agent. In `status --json` and `list --json` each guard reports its
+`agent`, or null, and `agent_ignored`, which means that agent is listed in
+`ignored-agents`. Whether the supervisor has applied it shows in the runtime
+decision reason `agent_ignored`: a dead guard, or a live one before its next
+poll, has not. `events` reads
 the structured transition journal.
 
 ### `stop` and `recover`

@@ -146,14 +146,17 @@ def test_job_and_restart_records_keep_the_agent_and_reject_ambiguous_ids(app_pat
         )
 
 
-def test_ignore_list_holds_one_agent_per_line(app_paths):
+def test_ignore_list_holds_one_valid_agent_per_line(app_paths):
+    store = JobStore(app_paths)
     assert read_ignored_agents(app_paths.ignored_agents) == frozenset()
 
+    # Windows PowerShell writes a byte order mark before the first id.
     app_paths.ignored_agents.write_text(
-        "# Agents the owner lets run at full speed\n\n"
-        "  3f2b8c1e-5d4a-4e9b-9c7d-1a2b3c4d5e6f  # Claude, warden\r\n"
+        "\ufeff3f2b8c1e-5d4a-4e9b-9c7d-1a2b3c4d5e6f  # Claude, warden\r\n"
+        "\n"
         "019a-codex-thread\n"
-        "#019a-commented-out\n",
+        "#019a-commented-out\n"
+        "two words\x1b[31m\n",
         encoding="utf-8",
     )
 
@@ -161,6 +164,36 @@ def test_ignore_list_holds_one_agent_per_line(app_paths):
         "3f2b8c1e-5d4a-4e9b-9c7d-1a2b3c4d5e6f",
         "019a-codex-thread",
     }
+    # The invalid entry is skipped and reported by line, never echoed.
+    report = [error for error in store.audit_state() if "ignored-agents" in error]
+    assert report == [f"{app_paths.ignored_agents}: skipped invalid agent ids on line 5"]
+    assert "\x1b" not in report[0]
+
+
+def test_ignore_list_must_be_a_small_regular_file(app_paths):
+    app_paths.ignored_agents.write_bytes(b"a" * (64 * 1024 + 1))
+    with pytest.raises(StateError, match="larger than 64 KiB"):
+        read_ignored_agents(app_paths.ignored_agents)
+    # Windows PowerShell 5 redirects text as UTF-16.
+    app_paths.ignored_agents.write_bytes("claude-1\n".encode("utf-16"))
+    with pytest.raises(StateError, match="not UTF-8"):
+        read_ignored_agents(app_paths.ignored_agents)
+    if os.name != "nt" and os.geteuid() != 0:
+        app_paths.ignored_agents.chmod(0)
+        with pytest.raises(StateError, match="cannot read the ignored agents"):
+            read_ignored_agents(app_paths.ignored_agents)
+    app_paths.ignored_agents.unlink()
+
+    if hasattr(os, "mkfifo"):
+        # Without a writer, a blocking open of a FIFO would never return.
+        os.mkfifo(app_paths.ignored_agents)
+        with pytest.raises(StateError, match="not a regular file"):
+            read_ignored_agents(app_paths.ignored_agents)
+        app_paths.ignored_agents.unlink()
+
+    app_paths.ignored_agents.mkdir()
+    with pytest.raises(StateError, match="ignored agents"):
+        read_ignored_agents(app_paths.ignored_agents)
 
 
 @pytest.mark.parametrize(

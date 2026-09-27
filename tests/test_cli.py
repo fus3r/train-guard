@@ -320,8 +320,8 @@ def test_keyboard_interrupt_has_a_distinct_exit_code(monkeypatch, capsys):
         ({"CODEX_THREAD_ID": "codex-1"}, [], "codex-1"),
         ({"CLAUDE_CODE_SESSION_ID": "claude-1"}, ["--agent", "chosen-agent"], "chosen-agent"),
         ({"CLAUDE_CODE_SESSION_ID": "claude-1"}, ["--agent", ""], None),
-        # A malformed session id must not block the launch.
-        ({"CLAUDE_CODE_SESSION_ID": "not an id"}, [], None),
+        # A malformed session id neither blocks the launch nor hides the next one.
+        ({"CLAUDE_CODE_SESSION_ID": "not an id", "CODEX_THREAD_ID": "codex-1"}, [], "codex-1"),
     ],
 )
 def test_run_records_the_agent_that_launched_the_job(
@@ -339,23 +339,21 @@ def test_run_records_the_agent_that_launched_the_job(
     assert JobStore(app_paths).read_spec("training").agent == expected
 
 
-def test_attach_records_the_agent_and_rejects_an_invalid_explicit_one(
-    fake_spawn,
-    monkeypatch,
-    app_paths,
-    capsys,
-):
-    monkeypatch.setenv("CODEX_THREAD_ID", "codex-1")
-    app_paths.ignored_agents.write_text("codex-1\n", encoding="utf-8")
+def test_attach_credits_an_agent_only_when_named(fake_spawn, monkeypatch, app_paths, capsys):
+    # A listed session asked to guard someone else's job must not exempt it.
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-1")
+    app_paths.ignored_agents.write_text("claude-1\n", encoding="utf-8")
     assert cli.main(["attach", "--match", "python train.py", "--name", "watch"]) == 0
-    assert JobStore(app_paths).read_spec("watch").agent == "codex-1"
-    # The agent learns that the owner exempts its job.
-    assert "the owner ignores agent codex-1" in capsys.readouterr().out
+    assert JobStore(app_paths).read_spec("watch").agent is None
+    assert "ignored-agents" not in capsys.readouterr().out
+
+    assert cli.main(["attach", "--pid", "123", "--name", "mine", "--agent", "claude-1"]) == 0
+    assert JobStore(app_paths).read_spec("mine").agent == "claude-1"
+    # The agent learns that its job runs at full speed.
+    assert "agent claude-1 is in ignored-agents" in capsys.readouterr().out
 
     spawned = len(fake_spawn)
-    assert (
-        cli.main(["run", "--name", "bad", "--agent", "two words", "--", "python", "train.py"]) == 2
-    )
+    assert cli.main(["attach", "--match", "python", "--name", "bad", "--agent", "two words"]) == 2
     assert len(fake_spawn) == spawned
     assert "agent ids" in capsys.readouterr().err
 
@@ -396,6 +394,11 @@ def test_status_and_list_report_each_agent_and_the_ignore_list(
     pin_sensors(monkeypatch)
     monkeypatch.setattr(cli, "_agent_installed", lambda: False)
     store = JobStore(app_paths)
+    store.write_spec(JobSpec.attached_pattern("plain", "python c.py"))
+    # Without a list or an agent, status shows nothing new.
+    assert cli.main(["status"]) == 0
+    assert "ignored agents" not in capsys.readouterr().out
+
     store.write_spec(JobSpec.attached_pattern("exempt", "python a.py", agent="claude-1"))
     store.write_spec(JobSpec.attached_pattern("guarded", "python b.py", agent="codex-1"))
     app_paths.ignored_agents.write_text("claude-1  # Claude, warden\n", encoding="utf-8")
@@ -408,11 +411,12 @@ def test_status_and_list_report_each_agent_and_the_ignore_list(
     } == {
         ("exempt", "claude-1", True),
         ("guarded", "codex-1", False),
+        ("plain", None, False),
     }
 
     assert cli.main(["status"]) == 0
     output = capsys.readouterr().out
-    assert "agent: claude-1  (ignored: runs at full speed)" in output
+    assert "agent: claude-1  (in ignored-agents)" in output
     assert "agent: codex-1\n" in output
 
     assert cli.main(["list", "--json"]) == 0
@@ -427,4 +431,4 @@ def test_status_and_list_report_each_agent_and_the_ignore_list(
     status = json.loads(capsys.readouterr().out)
     assert status["ignored_agents"] == []
     assert not any(guard["agent_ignored"] for guard in status["guards"])
-    assert any("cannot read the ignored agents" in error for error in status["state_errors"])
+    assert any("ignored agents" in error for error in status["state_errors"])

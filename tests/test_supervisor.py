@@ -529,19 +529,14 @@ class RecordingController:
         return ApplyReport(targeted=0)
 
 
-def _warm_battery():
-    # Between the resume and pause thresholds: only an active cooldown pauses
-    # for temperature here, so the decision reason shows whether one remains.
+def _on_battery():
     return SimpleNamespace(
-        sample=lambda: Observation(PowerSource.BATTERY, 60.0, 40.0, False, utc_now())
+        sample=lambda: Observation(PowerSource.BATTERY, 60.0, 30.0, False, utc_now())
     )
 
 
-def test_ignored_agent_runs_full_until_the_owner_removes_it(app_paths):
+def test_ignored_agent_runs_full_while_the_policy_keeps_its_cooldown(app_paths):
     atomic_json_write(app_paths.config, {"poll": 0.1})
-    app_paths.ignored_agents.write_text(
-        "# owner's choice\nclaude-session-1  # Claude, warden\n", encoding="utf-8"
-    )
     spec = JobSpec.launched(
         "training",
         ProcessIdentity(321, 1.0),
@@ -550,55 +545,64 @@ def test_ignored_agent_runs_full_until_the_owner_removes_it(app_paths):
     )
     store = JobStore(app_paths)
     store.write_spec(spec)
+    sensors = MutableSensors(43.0)
     controller = RecordingController()
-    supervisor = Supervisor(app_paths, spec, sensors=_warm_battery(), controller=controller)
-    # As if an earlier thermal pause of this job had not ended yet.
-    supervisor.policy.cooling = True
+    supervisor = Supervisor(app_paths, spec, sensors=sensors, controller=controller)
     thread, result = _run_in_thread(supervisor)
-    try:
-        _wait_until(
-            lambda: (
-                (store.read_runtime("training") or {}).get("decision", {}).get("reason")
-                == "agent_ignored"
+
+    def runtime_once(temperature, reason):
+        def reached():
+            runtime = store.read_runtime("training") or {}
+            return (
+                runtime.get("observation", {}).get("temperature_c") == temperature
+                and runtime.get("decision", {}).get("reason") == reason
             )
-        )
-        runtime = store.read_runtime("training")
-        assert runtime is not None
-        assert runtime["state"] == "full"
-        assert runtime["decision"] == {
-            "action": "full",
-            "reason": "agent_ignored",
-            "cooling": False,
-        }
-        assert runtime["cooling"] is False
+
+        _wait_until(reached)
+        return store.read_runtime("training")
+
+    try:
+        # The pack passed the pause threshold before the owner listed the agent.
+        runtime_once(43.0, "thermal_cooldown")
+        app_paths.ignored_agents.write_text("claude-session-1  # Claude, warden\n", "utf-8")
+        runtime = runtime_once(43.0, "agent_ignored")
+        assert runtime["decision"] == {"action": "full", "reason": "agent_ignored", "cooling": True}
         assert controller.actions[-1] is Action.FULL
 
-        app_paths.ignored_agents.write_text("# owner's choice\n", encoding="utf-8")
-        _wait_until(
-            lambda: (
-                (store.read_runtime("training") or {}).get("decision", {}).get("reason")
-                == "battery_disabled"
-            )
-        )
-        # The cleared cooldown does not come back: the policy starts fresh.
-        assert (store.read_runtime("training") or {})["decision"] == {
+        # The policy keeps tracking the cooldown while the job runs full.
+        sensors.temperature_c = 44.0
+        runtime_once(44.0, "agent_ignored")
+        sensors.temperature_c = 40.0
+        assert runtime_once(40.0, "agent_ignored")["cooling"] is True
+
+        # Taken off the list at 40 C, the job stays paused until the pack cools
+        # to the resume threshold, as a replay of the same readings would.
+        app_paths.ignored_agents.write_text("", encoding="utf-8")
+        runtime = runtime_once(40.0, "thermal_cooldown")
+        assert runtime["decision"] == {
             "action": "stop",
-            "reason": "battery_disabled",
-            "cooling": False,
+            "reason": "thermal_cooldown",
+            "cooling": True,
         }
         assert controller.actions[-1] is Action.STOP
+        sensors.temperature_c = 36.0
+        runtime = runtime_once(36.0, "ac_policy")
+        assert runtime["decision"] == {"action": "full", "reason": "ac_policy", "cooling": False}
     finally:
         store.request_stop("training", False)
         thread.join(timeout=5)
 
     assert result == [0]
     decisions = [
-        event["message"]
+        event
         for event in EventJournal(app_paths, "training").read()
         if event["event"] == "decision"
     ]
-    assert decisions[0].startswith("-> full (agent_ignored; power=battery")
-    assert decisions[-1].startswith("-> stop (battery_disabled; power=battery")
+    ignored = [event for event in decisions if event["decision"]["reason"] == "agent_ignored"]
+    assert ignored[0]["message"].startswith("-> full (agent_ignored; power=ac")
+    # Each override keeps the policy's own decision as evidence.
+    assert ignored[0]["policy"] == {"action": "stop", "reason": "thermal_cooldown", "cooling": True}
+    assert all("policy" not in event for event in decisions if event not in ignored)
 
 
 def test_unreadable_ignore_list_applies_the_policy_and_warns_once(app_paths):
@@ -613,7 +617,7 @@ def test_unreadable_ignore_list_applies_the_policy_and_warns_once(app_paths):
     )
     JobStore(app_paths).write_spec(spec)
     controller = RecordingController(live_cycles=3)
-    supervisor = Supervisor(app_paths, spec, sensors=_warm_battery(), controller=controller)
+    supervisor = Supervisor(app_paths, spec, sensors=_on_battery(), controller=controller)
     supervisor._install_signal_handlers = lambda: None
 
     assert supervisor.run() == 0

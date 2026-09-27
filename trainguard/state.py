@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -57,15 +58,24 @@ def validate_agent(value: Any) -> str:
     return value
 
 
-def parse_ignored_agents(text: str) -> frozenset[str]:
-    """Return the agent ids listed one per line; '#' starts a comment."""
+def parse_ignored_agents(text: str) -> tuple[frozenset[str], tuple[int, ...]]:
+    """Return the valid agent ids listed one per line, and the lines holding invalid ones.
 
-    agents = set()
-    for line in text.splitlines():
+    '#' starts a comment. Surrounding whitespace and blank lines are ignored.
+    An invalid entry is skipped, and its line number is returned for reports.
+    """
+
+    agents: set[str] = set()
+    invalid: list[int] = []
+    for number, line in enumerate(text.splitlines(), 1):
         entry = line.split("#", 1)[0].strip()
-        if entry:
-            agents.add(entry)
-    return frozenset(agents)
+        if not entry:
+            continue
+        try:
+            agents.add(validate_agent(entry))
+        except StateError:
+            invalid.append(number)
+    return frozenset(agents), tuple(invalid)
 
 
 def _replace_atomic(temporary: Path, destination: Path) -> None:
@@ -145,19 +155,46 @@ def read_json(path: Path) -> Any:
         raise StateError(f"{path}: invalid state file: {exc}") from exc
 
 
-def read_ignored_agents(path: Path) -> frozenset[str]:
+_IGNORED_AGENTS_LIMIT = 64 * 1024
+
+
+def load_ignored_agents(path: Path) -> tuple[frozenset[str], tuple[int, ...]]:
     """Read the owner's list of agents whose jobs run at full speed.
 
-    A missing file lists no agent. A file that exists but cannot be read is an
-    error, so a caller can report it instead of treating it as empty silently.
+    A missing file lists no agent. Anything else that is not a readable regular
+    UTF-8 file of at most 64 KiB is an error, so a caller can report it instead
+    of treating it as empty silently. The open does not block on a FIFO.
     """
 
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
-        return parse_ignored_agents(_read_text(path))
+        descriptor = os.open(path, flags)
     except FileNotFoundError:
-        return frozenset()
-    except (OSError, UnicodeDecodeError) as exc:
+        return frozenset(), ()
+    except OSError as exc:
         raise StateError(f"{path}: cannot read the ignored agents: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise StateError(f"{path}: the ignored agents list is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(_IGNORED_AGENTS_LIMIT + 1)
+    except OSError as exc:
+        raise StateError(f"{path}: cannot read the ignored agents: {exc}") from exc
+    finally:
+        os.close(descriptor)
+    if len(data) > _IGNORED_AGENTS_LIMIT:
+        raise StateError(f"{path}: the ignored agents list is larger than 64 KiB")
+    try:
+        # A byte order mark, as Windows PowerShell writes, must not hide the first id.
+        return parse_ignored_agents(data.decode("utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise StateError(f"{path}: the ignored agents list is not UTF-8: {exc}") from exc
+
+
+def read_ignored_agents(path: Path) -> frozenset[str]:
+    """Return the valid ids of the owner's list; ``audit_state`` reports the rest."""
+
+    return load_ignored_agents(path)[0]
 
 
 @dataclass(frozen=True)
@@ -799,7 +836,14 @@ class JobStore:
                 errors.append(str(exc))
 
         try:
-            read_ignored_agents(self.paths.ignored_agents)
+            _agents, invalid = load_ignored_agents(self.paths.ignored_agents)
         except StateError as exc:
             errors.append(str(exc))
+        else:
+            if invalid:
+                # Line numbers only: an invalid entry may hold control characters.
+                lines = ", ".join(str(number) for number in invalid)
+                errors.append(
+                    f"{self.paths.ignored_agents}: skipped invalid agent ids on line {lines}"
+                )
         return errors

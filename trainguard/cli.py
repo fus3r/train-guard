@@ -425,28 +425,33 @@ def _restart_on_login(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "restart_on_login", getattr(args, "persist", False)))
 
 
-# Claude Code and Codex export their session id to the commands they run.
+# Claude Code and Codex export their session id to the commands they run. When
+# one agent runs inside the other's shell, Claude Code's variable wins.
 _AGENT_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 
 
-def _job_agent(args: argparse.Namespace) -> Optional[str]:
+def _job_agent(args: argparse.Namespace, *, from_environment: bool) -> Optional[str]:
     """Return the agent session a new job belongs to.
 
     An explicit ``--agent`` wins and must be valid; an empty one records no
-    agent. Otherwise the job belongs to the session running this command. A
-    malformed environment value records no agent instead of blocking a launch.
+    agent. ``run`` otherwise credits the session running the command, skipping
+    a malformed variable rather than blocking the launch. ``attach`` credits no
+    one without ``--agent``: someone else started the process it guards.
     """
 
     explicit = getattr(args, "agent", None)
     if explicit is not None:
         return validate_agent(explicit) if explicit else None
+    if not from_environment:
+        return None
     for variable in _AGENT_VARIABLES:
         value = os.environ.get(variable)
-        if value:
-            try:
-                return validate_agent(value)
-            except StateError:
-                return None
+        if not value:
+            continue
+        try:
+            return validate_agent(value)
+        except StateError:
+            continue
     return None
 
 
@@ -462,8 +467,8 @@ def _ignored_agents(paths: AppPaths) -> frozenset[str]:
 def _print_ignored_note(paths: AppPaths, agent: Optional[str]) -> None:
     if agent is not None and agent in _ignored_agents(paths):
         print(
-            f"[train-guard] the owner ignores agent {agent}: this job runs at full speed, "
-            "whatever the power and temperature"
+            f"[train-guard] agent {agent} is in ignored-agents: this job runs at full speed "
+            "while the owner keeps it listed"
         )
 
 
@@ -514,7 +519,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return 2
     name = validate_job_name(args.name or f"job-{time.strftime('%H%M%S')}")
-    agent = _job_agent(args)
+    agent = _job_agent(args, from_environment=True)
     cwd = _working_directory(args.cwd)
     restart = _restart_on_login(args)
     log = paths.logs / f"{name}.log"
@@ -578,7 +583,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         )
         return 2
     name = validate_job_name(args.name or f"attach-{time.strftime('%H%M%S')}")
-    agent = _job_agent(args)
+    agent = _job_agent(args, from_environment=False)
     cwd = _working_directory(args.cwd)
     if args.pid:
         spec = JobSpec.attached_pid(
@@ -772,8 +777,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"(pid {item['guard']['pid']})  state={state}  pids={pids}"
         )
         if item["agent"]:
-            ignored = "  (ignored: runs at full speed)" if item["agent_ignored"] else ""
-            print(f"    agent: {item['agent']}{ignored}")
+            # Listed, not necessarily applied yet: the runtime decision says that.
+            listed = "  (in ignored-agents)" if item["agent_ignored"] else ""
+            print(f"    agent: {item['agent']}{listed}")
         if item["guard"].get("error"):
             print(f"    guard state invalid: {item['guard']['error']}")
         if item.get("runtime_error"):
@@ -783,12 +789,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"    last decision: {decision['action']} ({decision['reason']})")
         if runtime.get("config_error"):
             print(f"    config rejected: {runtime['config_error']}")
-    print()
-    print("ignored agents (their jobs run at full speed)")
-    for agent in payload["ignored_agents"]:
-        print(f"  {agent}")
-    if not payload["ignored_agents"]:
-        print("  none; the owner chooses which agents to ignore")
+    # Only for a list or agents in use, so status is unchanged for everyone else.
+    if paths.ignored_agents.exists() or any(item["agent"] for item in payload["guards"]):
+        print()
+        print("ignored agents (listed in ignored-agents)")
+        for agent in payload["ignored_agents"]:
+            print(f"  {agent}")
+        if not payload["ignored_agents"]:
+            print("  none; the owner chooses which agents to ignore")
     if payload["state_errors"]:
         print()
         print("state issues")
@@ -1461,14 +1469,11 @@ def cmd_uninstall_agent(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _add_agent_argument(parser: argparse.ArgumentParser) -> None:
+def _add_agent_argument(parser: argparse.ArgumentParser, default: str) -> None:
     parser.add_argument(
         "--agent",
         metavar="ID",
-        help=(
-            "agent session this job belongs to (default: CLAUDE_CODE_SESSION_ID, "
-            'then CODEX_THREAD_ID; "" records none)'
-        ),
+        help=f'agent session this job belongs to (default: {default}; "" records none)',
     )
 
 
@@ -1482,7 +1487,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="launch + supervise a new job")
     r.add_argument("--name")
-    _add_agent_argument(r)
+    _add_agent_argument(r, "CLAUDE_CODE_SESSION_ID, then CODEX_THREAD_ID")
     rg = r.add_mutually_exclusive_group()
     rg.add_argument(
         "--restart-on-login",
@@ -1503,7 +1508,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--name")
     a.add_argument("--match")
     a.add_argument("--pid", type=int)
-    _add_agent_argument(a)
+    _add_agent_argument(a, "none, since another session started the process")
     ag = a.add_mutually_exclusive_group()
     ag.add_argument(
         "--restart-on-login",

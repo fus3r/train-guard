@@ -118,9 +118,9 @@ There is one supervisor per named job. Each cycle follows the same sequence:
 2. Resolve the current root and descendant processes.
 3. Reload the policy if its content changed.
 4. Read one battery snapshot and the available pack temperature.
-5. Pass the immutable observation to the policy state machine, unless the
-   owner lists the job's agent in `ignored-agents`, which selects `full` with
-   the reason `agent_ignored` and clears the cooldown.
+5. Pass the immutable observation to the policy state machine. When the
+   owner lists the job's agent in `ignored-agents`, select `full` with the
+   reason `agent_ignored` instead; the policy keeps its cooldown state.
 6. Apply `full`, `gentle` or `stop` to the resolved processes.
 7. Atomically replace the runtime snapshot.
 8. Append an event when the decision, reason or observation changes.

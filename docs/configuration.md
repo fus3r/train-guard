@@ -50,8 +50,8 @@ The state machine evaluates a sample in this order:
 Thermal cooldown is stateful. A temperature reading below the pause threshold
 does not end an existing cooldown unless it also reaches the resume threshold.
 
-A live job whose agent the owner has exempted skips this order; see
-[ignored agents](#ignored-agents).
+For a live job whose agent the owner has exempted, the supervisor applies
+`full` in place of this order's result; see [ignored agents](#ignored-agents).
 
 ## Missing values
 
@@ -78,10 +78,13 @@ For the complete decision order and state model, read
 
 ## Ignored agents
 
-`run` and `attach` record the agent session that starts a job: the value of
-`--agent`, or else the `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID` variable
-that Claude Code and Codex export to the commands they run. Jobs started
-before version 0.5.0 have no agent.
+`run` records the agent session that starts a job: the value of `--agent`, or
+else `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, which Claude Code and
+Codex export to the commands they run. When both are set, as when one agent
+runs inside the other's shell, `CLAUDE_CODE_SESSION_ID` wins, and a malformed
+value is skipped. `attach` records an agent only from `--agent`, because
+someone else started the process it guards. Jobs started before version 0.5.0
+have no agent.
 
 The owner can exempt an agent's jobs by listing its id in `ignored-agents` in
 the state directory, one id per line:
@@ -91,25 +94,32 @@ the state directory, one id per line:
 3f2b8c1e-5d4a-4e9b-9c7d-1a2b3c4d5e6f  # optional note
 ```
 
-`#` starts a comment to the end of the line, and surrounding spaces and blank
-lines are ignored. An id has 1 to 128 characters without whitespace, control
-characters or `#`.
+The file is UTF-8, with or without a byte order mark. `#` starts a comment to
+the end of the line, and surrounding spaces and blank lines are ignored. An id
+has 1 to 128 characters without whitespace, control characters or `#`; a line
+holding anything else is skipped, and `status`, `list` and `doctor` report its
+line number. A program that writes the list should replace it atomically, by
+renaming a complete temporary file over it: a truncate-then-write can briefly
+expose an empty list to a supervisor reading it.
 
 For a job whose agent is listed, the supervisor applies `full` on every cycle
 with the reason `agent_ignored`, whatever the power source, charge and
-temperature. The battery, charge and thermal rules no longer apply to that
-job, and an active thermal cooldown is cleared. This changes the workload
-policy only; the operating system's own thermal protection is unaffected. The
-supervisor reads the list again on every cycle, so a change takes effect at
-the next poll. Once the agent leaves the list, the job follows the policy
-again from a fresh cooldown state.
+temperature. The policy still evaluates every observation, and each journal
+decision event of such a job keeps the policy's own decision under `policy`.
+Its thermal cooldown therefore keeps being tracked: when the agent leaves the list during a
+cooldown, the job stays paused until the pack cools to `temp_resume_c`. This
+changes the workload policy only; the operating system's own thermal
+protection is unaffected. The supervisor reads the list again on every cycle,
+so a change takes effect at the next poll.
 
-A missing file lists no agent. A file that exists but cannot be read also
-exempts no agent: the policy applies, the journal records
-`ignored_agents_unreadable` once for each distinct error, and `status`,
-`list` and `doctor` report it.
+A missing file lists no agent. A file that is not a regular file, is larger
+than 64 KiB or cannot be read also exempts no agent: the policy applies, the
+journal records `ignored_agents_unreadable` once for each distinct error, and
+`status`, `list` and `doctor` report it.
 
 The list records the owner's decision, for example one made in a menu bar app
 that monitors coding agents. An agent must not add its own id: the exemption
 sets aside the power and temperature policy the owner chose for this machine.
+Nothing enforces this rule. Any process running as the same user can edit the
+list or pass `--agent` with a listed id, and `status` shows the listed ids.
 `simulate` and `sweep` never read the list; they replay the policy alone.
