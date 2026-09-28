@@ -54,6 +54,11 @@ terminal copy of the last observation, so a completed journal closes its final
 recorded interval. A live journal is complete only through the latest recorded
 observation. Replay does not infer unrecorded temperature or charge changes.
 
+Intervals the journal marks `agent_ignored`, where the owner exempted the
+job's agent, replay as the policy's decisions, not as the `full` that was
+applied. Replay evaluates the policy alone; see
+[ignored agents](configuration.md#ignored-agents).
+
 A live journal can be read while its writer is mid-append, so an
 unparseable final line without a trailing newline is skipped. A torn or
 corrupt line anywhere else still fails with its line number.

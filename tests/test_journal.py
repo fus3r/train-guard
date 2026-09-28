@@ -195,6 +195,8 @@ def test_events_status_and_list_have_machine_readable_output(
     listing = json.loads(capsys.readouterr().out)
     assert listing == [
         {
+            "agent": None,
+            "agent_ignored": False,
             "alive": True,
             "mode": "attach",
             "name": "training",

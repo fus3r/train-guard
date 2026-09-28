@@ -10,6 +10,9 @@ def isolated_home(monkeypatch, tmp_path):
     home = tmp_path / "home"
     tg_home = home / ".train-guard"
     monkeypatch.setenv("TRAIN_GUARD_HOME", str(tg_home))
+    # Tests run inside Claude Code or Codex would otherwise record that session.
+    for variable in cli._AGENT_VARIABLES:
+        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(cli, "HOME", home)
     cli._sync_path_aliases(AppPaths.from_environment())
     yield

@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -40,6 +41,41 @@ def validate_job_name(name: str) -> str:
     if name.split(".", 1)[0].lower() in _RESERVED_NAMES:
         raise StateError(f"job name '{name}' is a reserved Windows device name")
     return name
+
+
+def validate_agent(value: Any) -> str:
+    """Return an agent session id that fits one line of the ignore list."""
+
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 128
+        or not value.isprintable()
+        or any(character.isspace() or character == "#" for character in value)
+    ):
+        raise StateError(
+            "agent ids must be 1-128 characters without whitespace, control characters or '#'"
+        )
+    return value
+
+
+def parse_ignored_agents(text: str) -> tuple[frozenset[str], tuple[int, ...]]:
+    """Return the valid agent ids listed one per line, and the lines holding invalid ones.
+
+    '#' starts a comment. Surrounding whitespace and blank lines are ignored.
+    An invalid entry is skipped, and its line number is returned for reports.
+    """
+
+    agents: set[str] = set()
+    invalid: list[int] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        entry = line.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        try:
+            agents.add(validate_agent(entry))
+        except StateError:
+            invalid.append(number)
+    return frozenset(agents), tuple(invalid)
 
 
 def _replace_atomic(temporary: Path, destination: Path) -> None:
@@ -119,6 +155,48 @@ def read_json(path: Path) -> Any:
         raise StateError(f"{path}: invalid state file: {exc}") from exc
 
 
+_IGNORED_AGENTS_LIMIT = 64 * 1024
+
+
+def load_ignored_agents(path: Path) -> tuple[frozenset[str], tuple[int, ...]]:
+    """Read the owner's list of agents whose jobs run at full speed.
+
+    A missing file lists no agent. Anything else that is not a readable regular
+    UTF-8 file of at most 64 KiB is an error, so a caller can report it instead
+    of treating it as empty silently. The open does not block on a FIFO.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return frozenset(), ()
+    except OSError as exc:
+        raise StateError(f"{path}: cannot read the ignored agents: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise StateError(f"{path}: the ignored agents list is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(_IGNORED_AGENTS_LIMIT + 1)
+    except OSError as exc:
+        raise StateError(f"{path}: cannot read the ignored agents: {exc}") from exc
+    finally:
+        os.close(descriptor)
+    if len(data) > _IGNORED_AGENTS_LIMIT:
+        raise StateError(f"{path}: the ignored agents list is larger than 64 KiB")
+    try:
+        # A byte order mark, as Windows PowerShell writes, must not hide the first id.
+        return parse_ignored_agents(data.decode("utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise StateError(f"{path}: the ignored agents list is not UTF-8: {exc}") from exc
+
+
+def read_ignored_agents(path: Path) -> frozenset[str]:
+    """Return the valid ids of the owner's list; ``audit_state`` reports the rest."""
+
+    return load_ignored_agents(path)[0]
+
+
 @dataclass(frozen=True)
 class AppPaths:
     home: Path
@@ -143,6 +221,10 @@ class AppPaths:
             persist=root / "persist",
             config=root / "config.json",
         )
+
+    @property
+    def ignored_agents(self) -> Path:
+        return self.home / "ignored-agents"
 
     def ensure(self) -> None:
         for directory in (self.home, self.run, self.logs, self.persist):
@@ -208,28 +290,48 @@ class JobSpec:
     legacy_pid: Optional[int] = None
     pattern: Optional[str] = None
     log_path: Optional[str] = None
+    # The Claude Code or Codex session that started the job, if any.
+    agent: Optional[str] = None
 
     @classmethod
-    def launched(cls, name: str, root: ProcessIdentity, log_path: Path) -> "JobSpec":
+    def launched(
+        cls,
+        name: str,
+        root: ProcessIdentity,
+        log_path: Path,
+        agent: Optional[str] = None,
+    ) -> "JobSpec":
         return cls(
             name=validate_job_name(name),
             mode="run",
             created_at=utc_now(),
             root=root,
             log_path=str(log_path),
+            agent=None if agent is None else validate_agent(agent),
         )
 
     @classmethod
-    def attached_pid(cls, name: str, root: ProcessIdentity) -> "JobSpec":
+    def attached_pid(
+        cls,
+        name: str,
+        root: ProcessIdentity,
+        agent: Optional[str] = None,
+    ) -> "JobSpec":
         return cls(
             name=validate_job_name(name),
             mode="run",
             created_at=utc_now(),
             root=root,
+            agent=None if agent is None else validate_agent(agent),
         )
 
     @classmethod
-    def attached_pattern(cls, name: str, pattern: str) -> "JobSpec":
+    def attached_pattern(
+        cls,
+        name: str,
+        pattern: str,
+        agent: Optional[str] = None,
+    ) -> "JobSpec":
         if not isinstance(pattern, str) or not pattern.strip():
             raise StateError("attach patterns cannot be empty")
         return cls(
@@ -237,6 +339,7 @@ class JobSpec:
             mode="attach",
             created_at=utc_now(),
             pattern=pattern,
+            agent=None if agent is None else validate_agent(agent),
         )
 
     @property
@@ -261,6 +364,8 @@ class JobSpec:
             value["pattern"] = self.pattern
         if self.log_path is not None:
             value["log"] = self.log_path
+        if self.agent is not None:
+            value["agent"] = self.agent
         return value
 
     @classmethod
@@ -314,6 +419,12 @@ class JobSpec:
         log_path = value.get("log")
         if log_path is not None and (not isinstance(log_path, str) or not log_path):
             raise StateError("job metadata log must be a non-empty string")
+        agent = value.get("agent")
+        if agent is not None:
+            try:
+                validate_agent(agent)
+            except StateError as exc:
+                raise StateError(f"job metadata agent is invalid: {exc}") from exc
         return cls(
             name=name,
             mode=raw_mode,
@@ -322,6 +433,7 @@ class JobSpec:
             legacy_pid=legacy_pid,
             pattern=pattern,
             log_path=log_path,
+            agent=agent,
         )
 
 
@@ -333,6 +445,8 @@ class PersistenceSpec:
     argv: tuple[str, ...] = ()
     pattern: Optional[str] = None
     start: Optional[str] = None
+    # A restarted job keeps the agent that started it, not the login session's.
+    agent: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -351,6 +465,8 @@ class PersistenceSpec:
             value["start"] = self.start or ""
         else:
             raise StateError(f"unsupported persistence mode: {self.mode!r}")
+        if self.agent is not None:
+            value["agent"] = validate_agent(self.agent)
         return value
 
     @classmethod
@@ -375,6 +491,12 @@ class PersistenceSpec:
         name = validate_job_name(raw_name)
         if not isinstance(cwd, str) or not cwd:
             raise StateError("persistence cwd must be a non-empty string")
+        agent = value.get("agent")
+        if agent is not None:
+            try:
+                validate_agent(agent)
+            except StateError as exc:
+                raise StateError(f"persistence agent is invalid: {exc}") from exc
 
         if mode == "run":
             argv = value.get("argv")
@@ -384,7 +506,7 @@ class PersistenceSpec:
                 or any(not isinstance(item, str) or not item for item in argv)
             ):
                 raise StateError("run persistence spec needs a non-empty argv list")
-            return cls(mode="run", name=name, cwd=cwd, argv=tuple(argv))
+            return cls(mode="run", name=name, cwd=cwd, argv=tuple(argv), agent=agent)
         if mode == "attach":
             pattern = value.get("pattern")
             if not isinstance(pattern, str) or not pattern.strip():
@@ -398,6 +520,7 @@ class PersistenceSpec:
                 cwd=cwd,
                 pattern=pattern,
                 start=start or None,
+                agent=agent,
             )
         raise StateError(f"unsupported persistence mode: {mode!r}")
 
@@ -711,4 +834,16 @@ class JobStore:
                 continue
             except StateError as exc:
                 errors.append(str(exc))
+
+        try:
+            _agents, invalid = load_ignored_agents(self.paths.ignored_agents)
+        except StateError as exc:
+            errors.append(str(exc))
+        else:
+            if invalid:
+                # Line numbers only: an invalid entry may hold control characters.
+                lines = ", ".join(str(number) for number in invalid)
+                errors.append(
+                    f"{self.paths.ignored_agents}: skipped invalid agent ids on line {lines}"
+                )
         return errors

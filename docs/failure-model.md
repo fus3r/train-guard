@@ -40,6 +40,16 @@ invalid, it keeps the last valid in-memory policy, writes the error to
 After a valid correction, it emits `config_loaded` and uses the new policy on
 the next cycle.
 
+## Unreadable ignore list
+
+If `ignored-agents` exists but is not a regular file, is larger than 64 KiB or
+cannot be read, no agent is exempt: the policy applies to every job, the
+supervisor emits `ignored_agents_unreadable` once for each distinct error, and
+`status`, `list` and `doctor` report the file as a state issue. The open does
+not wait on a FIFO. Once the file can be read again, the next cycle uses it. A
+line that holds no valid agent id is skipped, and the same reports give its
+line number without echoing its content.
+
 ## Missing sensor data
 
 Missing battery temperature disables thermal rules for that observation. Power

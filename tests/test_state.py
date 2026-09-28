@@ -17,6 +17,7 @@ from trainguard.state import (
     PersistenceSpec,
     StateError,
     atomic_json_write,
+    read_ignored_agents,
     read_json,
     validate_job_name,
 )
@@ -111,6 +112,90 @@ def test_job_guard_and_persistence_records_are_separate_and_filename_bound(app_p
                 "argv": ["python"],
             }
         )
+
+
+def test_job_and_restart_records_keep_the_agent_and_reject_ambiguous_ids(app_paths):
+    store = JobStore(app_paths)
+    spec = JobSpec.attached_pattern("training", "python train.py", agent="019a-codex-thread")
+    persistence = PersistenceSpec(
+        mode="attach",
+        name="training",
+        cwd="/tmp/work",
+        pattern="python train.py",
+        agent="019a-codex-thread",
+    )
+
+    store.write_spec(spec)
+    store.write_persistence(persistence)
+
+    assert store.read_spec("training") == spec
+    assert read_json(store.spec_path("training"))["agent"] == "019a-codex-thread"
+    assert store.read_persistence(store.persistence_path("training")) == persistence
+    # A record without an agent keeps the pre-0.5 shape older readers expect.
+    assert "agent" not in JobSpec.attached_pattern("other", "python eval.py").to_dict()
+
+    # Each id must fit one line of the ignore list and cannot hide a comment.
+    for invalid in ("", "two words", "tab\tinside", "id#comment", "x" * 129, "bell\x07", 7):
+        with pytest.raises(StateError, match="agent"):
+            JobSpec.from_dict(
+                {"name": "job", "mode": "attach", "pattern": "python", "agent": invalid}
+            )
+    with pytest.raises(StateError, match="persistence agent"):
+        PersistenceSpec.from_dict(
+            {"mode": "run", "name": "job", "cwd": "/tmp", "argv": ["python"], "agent": ""}
+        )
+
+
+def test_ignore_list_holds_one_valid_agent_per_line(app_paths):
+    store = JobStore(app_paths)
+    assert read_ignored_agents(app_paths.ignored_agents) == frozenset()
+
+    # Windows PowerShell writes a byte order mark before the first id. Bytes, not
+    # text, so Windows does not turn the CRLF into CR CR LF.
+    app_paths.ignored_agents.write_bytes(
+        (
+            "\ufeff3f2b8c1e-5d4a-4e9b-9c7d-1a2b3c4d5e6f  # Claude, warden\r\n"
+            "\n"
+            "019a-codex-thread\n"
+            "#019a-commented-out\n"
+            "two words\x1b[31m\n"
+        ).encode("utf-8")
+    )
+
+    assert read_ignored_agents(app_paths.ignored_agents) == {
+        "3f2b8c1e-5d4a-4e9b-9c7d-1a2b3c4d5e6f",
+        "019a-codex-thread",
+    }
+    # The invalid entry is skipped and reported by line, never echoed.
+    report = [error for error in store.audit_state() if "ignored-agents" in error]
+    assert report == [f"{app_paths.ignored_agents}: skipped invalid agent ids on line 5"]
+    assert "\x1b" not in report[0]
+
+
+def test_ignore_list_must_be_a_small_regular_file(app_paths):
+    app_paths.ignored_agents.write_bytes(b"a" * (64 * 1024 + 1))
+    with pytest.raises(StateError, match="larger than 64 KiB"):
+        read_ignored_agents(app_paths.ignored_agents)
+    # Windows PowerShell 5 redirects text as UTF-16.
+    app_paths.ignored_agents.write_bytes("claude-1\n".encode("utf-16"))
+    with pytest.raises(StateError, match="not UTF-8"):
+        read_ignored_agents(app_paths.ignored_agents)
+    if os.name != "nt" and os.geteuid() != 0:
+        app_paths.ignored_agents.chmod(0)
+        with pytest.raises(StateError, match="cannot read the ignored agents"):
+            read_ignored_agents(app_paths.ignored_agents)
+    app_paths.ignored_agents.unlink()
+
+    if hasattr(os, "mkfifo"):
+        # Without a writer, a blocking open of a FIFO would never return.
+        os.mkfifo(app_paths.ignored_agents)
+        with pytest.raises(StateError, match="not a regular file"):
+            read_ignored_agents(app_paths.ignored_agents)
+        app_paths.ignored_agents.unlink()
+
+    app_paths.ignored_agents.mkdir()
+    with pytest.raises(StateError, match="ignored agents"):
+        read_ignored_agents(app_paths.ignored_agents)
 
 
 @pytest.mark.parametrize(

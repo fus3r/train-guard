@@ -5,7 +5,7 @@ from __future__ import annotations
 import signal
 import threading
 from dataclasses import asdict, replace
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import psutil
 
@@ -15,6 +15,8 @@ if __package__:
     from .model import (
         Action,
         Observation,
+        OverrideDecision,
+        OverrideReason,
         PolicyDecision,
         ProcessIdentity,
         utc_now,
@@ -22,15 +24,26 @@ if __package__:
     from .policy import PolicyEngine
     from .processes import ApplyReport, ProcessController, process_identity
     from .sensors import SensorReader
-    from .state import AppPaths, JobSpec, JobStore, StateError
+    from .state import AppPaths, JobSpec, JobStore, StateError, read_ignored_agents
 else:  # Keep ``python trainguard/cli.py`` working from a checkout.
     from config import ConfigError, ConfigWatcher, load_policy
     from journal import EventJournal
-    from model import Action, Observation, PolicyDecision, ProcessIdentity, utc_now
+    from model import (
+        Action,
+        Observation,
+        OverrideDecision,
+        OverrideReason,
+        PolicyDecision,
+        ProcessIdentity,
+        utc_now,
+    )
     from policy import PolicyEngine
     from processes import ApplyReport, ProcessController, process_identity
     from sensors import SensorReader
-    from state import AppPaths, JobSpec, JobStore, StateError
+    from state import AppPaths, JobSpec, JobStore, StateError, read_ignored_agents
+
+# What the supervisor applies: the policy's decision or its own override.
+Decision = Union[PolicyDecision, OverrideDecision]
 
 
 def _runtime_payload(
@@ -200,7 +213,8 @@ class Supervisor:
         self._last_transition: Optional[tuple[str, str, str]] = None
         self._last_waiting = False
         self._last_observation: Optional[Observation] = None
-        self._last_decision: Optional[PolicyDecision] = None
+        self._last_decision: Optional[Decision] = None
+        self._ignored_agents_error: Optional[str] = None
 
     def _handle_signal(self, signum: int, _frame: Any) -> None:
         try:
@@ -213,6 +227,30 @@ class Supervisor:
         for signal_name in ("SIGINT", "SIGTERM"):
             if hasattr(signal, signal_name):
                 signal.signal(getattr(signal, signal_name), self._handle_signal)
+
+    def _agent_ignored(self) -> bool:
+        """Whether the owner lets this job's agent bypass the policy.
+
+        The list is read on every cycle. When it cannot be read, the policy
+        applies, and each distinct failure is journaled once.
+        """
+
+        if self.spec.agent is None:
+            return False
+        try:
+            ignored = read_ignored_agents(self.paths.ignored_agents)
+        except StateError as exc:
+            error = str(exc)
+            if error != self._ignored_agents_error:
+                self.journal.emit(
+                    "ignored_agents_unreadable",
+                    f"IGNORED AGENTS unreadable: {error}; applying the policy",
+                    error=error,
+                )
+                self._ignored_agents_error = error
+            return False
+        self._ignored_agents_error = None
+        return self.spec.agent in ignored
 
     def _write_runtime(
         self,
@@ -406,7 +444,17 @@ class Supervisor:
                             f"SENSOR {warning}",
                         )
                     warned = observation.warnings
-                decision = self.policy.decide(config, observation)
+                # The policy decides every cycle, even for an ignored agent, so
+                # its thermal cooldown stays true to the pack: a job whose agent
+                # leaves the list stays paused until the pack has cooled.
+                policy_decision = self.policy.decide(config, observation)
+                decision: Decision = policy_decision
+                if self._agent_ignored():
+                    decision = OverrideDecision(
+                        Action.FULL,
+                        OverrideReason.AGENT_IGNORED,
+                        cooling=policy_decision.cooling,
+                    )
                 self._last_observation = observation
                 self._last_decision = decision
                 report = self.controller.apply(decision.action, processes)
@@ -424,6 +472,10 @@ class Supervisor:
                     observation.signature(),
                 )
                 if transition != self._last_transition:
+                    # An override keeps what the policy decided as evidence.
+                    evidence = (
+                        {} if decision is policy_decision else {"policy": policy_decision.to_dict()}
+                    )
                     self.journal.emit(
                         "decision",
                         f"-> {decision.action.value} "
@@ -432,6 +484,7 @@ class Supervisor:
                         decision=decision.to_dict(),
                         process_report=_report_payload(report),
                         pids=pids,
+                        **evidence,
                     )
                     self._last_transition = transition
                 self._shutdown.wait(config.poll)

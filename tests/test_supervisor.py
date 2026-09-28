@@ -3,11 +3,13 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import psutil
 import pytest
 
 from trainguard import cli
+from trainguard.journal import EventJournal
 from trainguard.model import Action, Observation, PowerSource, ProcessIdentity, utc_now
 from trainguard.processes import (
     ApplyReport,
@@ -498,3 +500,129 @@ def test_orphan_recovery_keeps_denied_identity_for_retry(
         assert not store.runtime_path("orphan").exists()
     finally:
         _resume_and_terminate(worker)
+
+
+class RecordingController:
+    """Report one live target and record the actions applied to it."""
+
+    def __init__(self, live_cycles=None):
+        self.live_cycles = live_cycles
+        self.actions = []
+
+    @property
+    def owned_suspensions(self):
+        return ()
+
+    @property
+    def tuned_processes(self):
+        return ()
+
+    def resolve(self, _spec):
+        alive = self.live_cycles is None or len(self.actions) < self.live_cycles
+        return TargetSnapshot((SimpleNamespace(pid=321),) if alive else (), alive)
+
+    def apply(self, action, processes):
+        self.actions.append(action)
+        return ApplyReport(targeted=len(tuple(processes)))
+
+    def release_owned(self):
+        return ApplyReport(targeted=0)
+
+
+def _on_battery():
+    return SimpleNamespace(
+        sample=lambda: Observation(PowerSource.BATTERY, 60.0, 30.0, False, utc_now())
+    )
+
+
+def test_ignored_agent_runs_full_while_the_policy_keeps_its_cooldown(app_paths):
+    atomic_json_write(app_paths.config, {"poll": 0.1})
+    spec = JobSpec.launched(
+        "training",
+        ProcessIdentity(321, 1.0),
+        app_paths.logs / "training.log",
+        agent="claude-session-1",
+    )
+    store = JobStore(app_paths)
+    store.write_spec(spec)
+    sensors = MutableSensors(43.0)
+    controller = RecordingController()
+    supervisor = Supervisor(app_paths, spec, sensors=sensors, controller=controller)
+    thread, result = _run_in_thread(supervisor)
+
+    def runtime_once(temperature, reason):
+        def reached():
+            runtime = store.read_runtime("training") or {}
+            return (
+                runtime.get("observation", {}).get("temperature_c") == temperature
+                and runtime.get("decision", {}).get("reason") == reason
+            )
+
+        _wait_until(reached)
+        return store.read_runtime("training")
+
+    try:
+        # The pack passed the pause threshold before the owner listed the agent.
+        runtime_once(43.0, "thermal_cooldown")
+        app_paths.ignored_agents.write_text("claude-session-1  # Claude, warden\n", "utf-8")
+        runtime = runtime_once(43.0, "agent_ignored")
+        assert runtime["decision"] == {"action": "full", "reason": "agent_ignored", "cooling": True}
+        assert controller.actions[-1] is Action.FULL
+
+        # The policy keeps tracking the cooldown while the job runs full.
+        sensors.temperature_c = 44.0
+        runtime_once(44.0, "agent_ignored")
+        sensors.temperature_c = 40.0
+        assert runtime_once(40.0, "agent_ignored")["cooling"] is True
+
+        # Taken off the list at 40 C, the job stays paused until the pack cools
+        # to the resume threshold, as a replay of the same readings would.
+        app_paths.ignored_agents.write_text("", encoding="utf-8")
+        runtime = runtime_once(40.0, "thermal_cooldown")
+        assert runtime["decision"] == {
+            "action": "stop",
+            "reason": "thermal_cooldown",
+            "cooling": True,
+        }
+        assert controller.actions[-1] is Action.STOP
+        sensors.temperature_c = 36.0
+        runtime = runtime_once(36.0, "ac_policy")
+        assert runtime["decision"] == {"action": "full", "reason": "ac_policy", "cooling": False}
+    finally:
+        store.request_stop("training", False)
+        thread.join(timeout=5)
+
+    assert result == [0]
+    decisions = [
+        event
+        for event in EventJournal(app_paths, "training").read()
+        if event["event"] == "decision"
+    ]
+    ignored = [event for event in decisions if event["decision"]["reason"] == "agent_ignored"]
+    assert ignored[0]["message"].startswith("-> full (agent_ignored; power=ac")
+    # Each override keeps the policy's own decision as evidence.
+    assert ignored[0]["policy"] == {"action": "stop", "reason": "thermal_cooldown", "cooling": True}
+    assert all("policy" not in event for event in decisions if event not in ignored)
+
+
+def test_unreadable_ignore_list_applies_the_policy_and_warns_once(app_paths):
+    atomic_json_write(app_paths.config, {"poll": 0.1})
+    # The path exists but cannot be read as a list.
+    app_paths.ignored_agents.mkdir()
+    spec = JobSpec.launched(
+        "training",
+        ProcessIdentity(321, 1.0),
+        app_paths.logs / "training.log",
+        agent="claude-session-1",
+    )
+    JobStore(app_paths).write_spec(spec)
+    controller = RecordingController(live_cycles=3)
+    supervisor = Supervisor(app_paths, spec, sensors=_on_battery(), controller=controller)
+    supervisor._install_signal_handlers = lambda: None
+
+    assert supervisor.run() == 0
+
+    assert controller.actions == [Action.STOP] * 3
+    events = [event["event"] for event in EventJournal(app_paths, "training").read()]
+    assert events.count("ignored_agents_unreadable") == 1
+    assert any("ignored agents" in error for error in JobStore(app_paths).audit_state())
