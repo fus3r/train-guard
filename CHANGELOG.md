@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-09-28
 
 - Record the agent session that starts a job. `run` takes `--agent ID` and
   otherwise reads `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, which
