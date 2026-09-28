@@ -150,14 +150,16 @@ def test_ignore_list_holds_one_valid_agent_per_line(app_paths):
     store = JobStore(app_paths)
     assert read_ignored_agents(app_paths.ignored_agents) == frozenset()
 
-    # Windows PowerShell writes a byte order mark before the first id.
-    app_paths.ignored_agents.write_text(
-        "\ufeff3f2b8c1e-5d4a-4e9b-9c7d-1a2b3c4d5e6f  # Claude, warden\r\n"
-        "\n"
-        "019a-codex-thread\n"
-        "#019a-commented-out\n"
-        "two words\x1b[31m\n",
-        encoding="utf-8",
+    # Windows PowerShell writes a byte order mark before the first id. Bytes, not
+    # text, so Windows does not turn the CRLF into CR CR LF.
+    app_paths.ignored_agents.write_bytes(
+        (
+            "\ufeff3f2b8c1e-5d4a-4e9b-9c7d-1a2b3c4d5e6f  # Claude, warden\r\n"
+            "\n"
+            "019a-codex-thread\n"
+            "#019a-commented-out\n"
+            "two words\x1b[31m\n"
+        ).encode("utf-8")
     )
 
     assert read_ignored_agents(app_paths.ignored_agents) == {
