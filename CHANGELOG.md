@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased (0.5.1.dev0)
+
+- Apply Warden's all-jobs exceptions to current and future jobs, including jobs
+  without an agent. Timed exceptions expire in each supervisor even when Warden
+  is closed; ending one preserves per-session exceptions and thermal cooldown.
+- Start supervisors and login restarts correctly from a self-contained runtime.
+
 ## 0.5.0 - 2026-09-28
 
 - Record the agent session that starts a job. `run` takes `--agent ID` and

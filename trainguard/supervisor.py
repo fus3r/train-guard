@@ -10,6 +10,7 @@ from typing import Any, Optional, Union
 import psutil
 
 if __package__:
+    from .agents import global_ignored
     from .config import ConfigError, ConfigWatcher, load_policy
     from .journal import EventJournal
     from .model import (
@@ -26,6 +27,7 @@ if __package__:
     from .sensors import SensorReader
     from .state import AppPaths, JobSpec, JobStore, StateError, read_ignored_agents
 else:  # Keep ``python trainguard/cli.py`` working from a checkout.
+    from agents import global_ignored
     from config import ConfigError, ConfigWatcher, load_policy
     from journal import EventJournal
     from model import (
@@ -449,7 +451,13 @@ class Supervisor:
                 # leaves the list stays paused until the pack has cooled.
                 policy_decision = self.policy.decide(config, observation)
                 decision: Decision = policy_decision
-                if self._agent_ignored():
+                if global_ignored(self.paths.home):
+                    decision = OverrideDecision(
+                        Action.FULL,
+                        OverrideReason.GLOBAL_IGNORED,
+                        cooling=policy_decision.cooling,
+                    )
+                elif self._agent_ignored():
                     decision = OverrideDecision(
                         Action.FULL,
                         OverrideReason.AGENT_IGNORED,

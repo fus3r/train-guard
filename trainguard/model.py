@@ -53,6 +53,7 @@ class OverrideReason(str, Enum):
     """
 
     AGENT_IGNORED = "agent_ignored"
+    GLOBAL_IGNORED = "global_ignored"
 
 
 @dataclass(frozen=True)

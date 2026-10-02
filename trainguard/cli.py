@@ -112,7 +112,7 @@ else:  # Keep direct execution from a checkout working.
         run_sweep,
     )
 
-__version__ = "0.5.0"
+__version__ = "0.5.1.dev0"
 _SUPERVISOR_START_TIMEOUT_SECONDS = 5.0
 SYSTEM = platform.system()  # 'Darwin' | 'Linux' | 'Windows'
 HOME = Path.home()
@@ -285,11 +285,20 @@ def _terminate_spawned(process: subprocess.Popen[Any]) -> None:
             pass
 
 
+def _command_argv(*args: str) -> list[str]:
+    # A packaged command carries its interpreter. Passing __file__ to that
+    # executable would make it parse the module path as a CLI subcommand.
+    prefix = [sys.executable]
+    if not getattr(sys, "frozen", False):
+        prefix.append(str(Path(__file__).resolve()))
+    return [*prefix, *args]
+
+
 def _supervisor_argv(
     name: str,
     excluded_identity: Optional[ProcessIdentity] = None,
 ) -> list[str]:
-    argv = [sys.executable, str(Path(__file__).resolve()), "__supervise", name]
+    argv = _command_argv("__supervise", name)
     if excluded_identity is not None:
         argv.extend(
             [
@@ -1453,7 +1462,7 @@ def cmd_unpersist(args: argparse.Namespace) -> int:
 
 def cmd_install_agent(_args: argparse.Namespace) -> int:
     paths = _paths()
-    restart_argv = [sys.executable, str(Path(__file__).resolve()), "restart-persisted"]
+    restart_argv = _command_argv("restart-persisted")
     target = install_agent(paths, restart_argv, SYSTEM)
     print(f"[train-guard] login restart agent installed: {target}")
     if SYSTEM == "Linux":

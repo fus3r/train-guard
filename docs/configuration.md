@@ -123,3 +123,21 @@ sets aside the power and temperature policy the owner chose for this machine.
 Nothing enforces this rule. Any process running as the same user can edit the
 list or pass `--agent` with a listed id, and `status` shows the listed ids.
 `simulate` and `sweep` never read the list; they replay the policy alone.
+
+## All-jobs exceptions
+
+Warden can exempt all current and future jobs, including jobs without an agent,
+using `global-override.json` in the state directory:
+
+```json
+{"schema_version": 1, "enabled": true, "expires_at": 1790978400}
+```
+
+`expires_at` is a Unix timestamp in seconds, or `null` for an exception that
+lasts until the owner ends it. Each supervisor rereads the file on every poll
+and applies `full` with reason `global_ignored` while it is active. Expiry works
+without Warden running or removing the file. A missing, invalid, disabled or
+expired exception leaves the normal policy and per-session list in effect.
+The policy still tracks thermal cooldown, and the journal records its decision
+under `policy`. Ending an all-jobs exception does not edit either the policy or
+the per-session list. Agents must not change this owner-controlled file.
